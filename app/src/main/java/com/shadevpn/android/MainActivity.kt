@@ -35,9 +35,13 @@ import com.shadevpn.android.model.ConnectionSnapshot
 import com.shadevpn.android.model.FailureReason
 import com.shadevpn.android.service.ConnectionOrchestrator
 import com.shadevpn.android.service.ShadeVpnServiceController
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     private val orchestrator = ConnectionOrchestrator()
+    private val scope = CoroutineScope(Dispatchers.Main)
 
     private val vpnPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         orchestrator.onPermissionResult(result.resultCode == Activity.RESULT_OK)
@@ -51,13 +55,25 @@ class MainActivity : ComponentActivity() {
                 state = state,
                 onPrepare = { requestVpnPermission() },
                 onLoadProfile = { raw -> orchestrator.loadProfile(raw) },
-                onBuildLane = {
-                    orchestrator.buildRealityLane()
-                        .onSuccess { orchestrator.markControlPlaneReady() }
-                        .onFailure { orchestrator.fail(FailureReason.JNI_ERROR, "Native lane preparation failed") }
+                onConnect = { profile ->
+                    scope.launch {
+                        val ok = orchestrator.loadProfile(profile).isSuccess &&
+                            orchestrator.state.value.permissionGranted
+                        if (ok) {
+                            ShadeVpnServiceController.start(this@MainActivity, profile)
+                        }
+                    }
                 },
-                onSimulateProbe = { orchestrator.markDataPlaneReady() },
-                onStop = { ShadeVpnServiceController.stop(this) }
+                onProbeControlPlane = {
+                    scope.launch(Dispatchers.IO) { orchestrator.probeControlPlane() }
+                },
+                onProbeDataPlane = {
+                    scope.launch(Dispatchers.IO) { orchestrator.runDataPlaneProbe() }
+                },
+                onStop = {
+                    orchestrator.stopPump()
+                    ShadeVpnServiceController.stop(this)
+                }
             )
         }
     }
@@ -78,16 +94,17 @@ private fun ShadeVpnApp(
     state: ConnectionSnapshot,
     onPrepare: () -> Unit,
     onLoadProfile: (String) -> Result<*>,
-    onBuildLane: () -> Unit,
-    onSimulateProbe: () -> Unit,
+    onConnect: (String) -> Unit,
+    onProbeControlPlane: () -> Unit,
+    onProbeDataPlane: () -> Unit,
     onStop: () -> Unit
 ) {
     var rawProfile by remember {
-        mutableStateOf("vless://00000000-0000-0000-0000-000000000000@example.com:443?security=reality&type=tcp&sni=cdn.example.com&pbk=publicKey&sid=short#ShadeVPN%20Reality")
+        mutableStateOf("vless://00000000-0000-0000-0000-000000000000@example.com:443?security=reality&type=tcp&sni=cdn.example.com&pbk=publicKey&sid=01ab#ShadeVPN%20Reality")
     }
+
     MaterialTheme {
-        Scaffold {
-            padding -> Column(
+        Scaffold { padding -> Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
@@ -97,7 +114,7 @@ private fun ShadeVpnApp(
             ) {
                 Text("ShadeVPN", style = MaterialTheme.typography.headlineLarge)
                 Spacer(Modifier.height(8.dp))
-                Text("Milestone 2: orchestration, profile parsing, Reality lane skeleton")
+                Text("Milestone 3: real Reality handshake, data-plane probe, packet pump")
                 Spacer(Modifier.height(20.dp))
                 StatusCard(state)
                 Spacer(Modifier.height(20.dp))
@@ -107,7 +124,7 @@ private fun ShadeVpnApp(
                     modifier = Modifier.fillMaxWidth(),
                     label = { Text("Reality profile") },
                     minLines = 4,
-                    supportingText = { Text("Secrets stay out of logs. Connected stays fake until probe passes.") }
+                    supportingText = { Text("Key material never leaves the handshake path or gets logged.") }
                 )
                 Spacer(Modifier.height(12.dp))
                 Button(onClick = onPrepare, modifier = Modifier.fillMaxWidth()) { Text("1. Request VPN permission") }
@@ -115,18 +132,24 @@ private fun ShadeVpnApp(
                 Button(onClick = { onLoadProfile(rawProfile) }, modifier = Modifier.fillMaxWidth()) { Text("2. Parse VLESS + Reality profile") }
                 Spacer(Modifier.height(8.dp))
                 Button(
-                    onClick = onBuildLane,
+                    onClick = { onConnect(rawProfile) },
                     enabled = state.selectedProfile != null && state.permissionGranted,
                     modifier = Modifier.fillMaxWidth()
-                ) { Text("3. Build native Reality lane") }
+                ) { Text("3. Connect (handshake + probe + pump)") }
                 Spacer(Modifier.height(8.dp))
                 Button(
-                    onClick = onSimulateProbe,
-                    enabled = state.phase == ConnectionPhase.PROBING_DATA,
+                    onClick = onProbeControlPlane,
+                    enabled = state.selectedProfile != null && !state.controlPlaneReady,
                     modifier = Modifier.fillMaxWidth()
-                ) { Text("4. Mark data-plane probe success") }
+                ) { Text("Check control plane (TCP reachability)") }
                 Spacer(Modifier.height(8.dp))
-                Button(onClick = onStop, modifier = Modifier.fillMaxWidth()) { Text("Stop service") }
+                Button(
+                    onClick = onProbeDataPlane,
+                    enabled = state.handshakeCompleted,
+                    modifier = Modifier.fillMaxWidth()
+                ) { Text("Run data-plane probe") }
+                Spacer(Modifier.height(8.dp))
+                Button(onClick = onStop, modifier = Modifier.fillMaxWidth()) { Text("Disconnect") }
             }
         }
     }
@@ -139,18 +162,21 @@ private fun StatusCard(state: ConnectionSnapshot) {
         Spacer(Modifier.height(6.dp))
         Text("Phase: ${state.phase}")
         Text("Lane: ${state.activeLane}")
-        Text("Failure: ${state.failureReason}")
+        Text("Failure: ${state.failureReason}${if (state.failureDetail.isNotBlank()) \" (${state.failureDetail})\" else \"\"}")
         Text("Native: ${state.nativeVersion}")
         Text("Permission: ${state.permissionGranted}")
         Text("TUN: ${state.tunEstablished}")
         Text("Control probe: ${state.controlPlaneReady}")
+        Text("Handshake initiated: ${state.handshakeInitiated}")
+        Text("Handshake completed: ${state.handshakeCompleted}")
         Text("Data probe: ${state.dataPlaneReady}")
+        Text("Pump: ${state.pumpRunning}")
         Spacer(Modifier.height(10.dp))
         Text(
             text = when (state.phase) {
-                ConnectionPhase.CONNECTED -> "Good: UI only says connected after data-plane proof."
-                ConnectionPhase.FAILED -> "Good failure: ${failureText(state.failureReason)}"
-                else -> "Still scaffold, but honest scaffold."
+                ConnectionPhase.CONNECTED -> "Connected for real: data-plane probe passed."
+                ConnectionPhase.FAILED -> "Failure: ${failureText(state.failureReason)}${if (state.failureDetail.isNotBlank()) \" — ${state.failureDetail}\" else \"\"}"
+                else -> "Not connected until the data-plane probe passes."
             },
             fontFamily = FontFamily.Monospace
         )
@@ -160,8 +186,8 @@ private fun StatusCard(state: ConnectionSnapshot) {
 private fun failureText(reason: FailureReason): String = when (reason) {
     FailureReason.PERMISSION_DENIED -> "user blocked VPN permission"
     FailureReason.INVALID_PROFILE -> "profile parse or validation failed"
-    FailureReason.JNI_ERROR -> "native lane skeleton rejected payload"
-    FailureReason.CONTROL_PLANE_FAILED -> "handshake failed"
+    FailureReason.JNI_ERROR -> "native layer rejected the request"
+    FailureReason.CONTROL_PLANE_FAILED -> "reachability or handshake failed"
     FailureReason.DATA_PLANE_FAILED -> "probe failed"
     FailureReason.VPN_REVOKED -> "Android revoked the tunnel"
     FailureReason.TUN_SETUP_FAILED -> "builder never produced a TUN fd"

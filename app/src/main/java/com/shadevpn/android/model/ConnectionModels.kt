@@ -44,10 +44,14 @@ data class ConnectionSnapshot(
     val activeLane: String = "none",
     val statusLine: String = "Not connected",
     val failureReason: FailureReason = FailureReason.NONE,
+    val failureDetail: String = "",
     val permissionGranted: Boolean = false,
     val tunEstablished: Boolean = false,
     val controlPlaneReady: Boolean = false,
     val dataPlaneReady: Boolean = false,
+    val handshakeInitiated: Boolean = false,
+    val handshakeCompleted: Boolean = false,
+    val pumpRunning: Boolean = false,
     val nativeVersion: String = "unavailable",
     val selectedProfile: VlessProfile? = null
 )

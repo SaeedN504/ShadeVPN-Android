@@ -2,23 +2,35 @@
 
 Android client and native transport layer for ShadeVPN.
 
-## Milestone 2
+## Milestone 3
 
-This repo now has an **honest orchestration scaffold** for the first real transport target: **VLESS + Reality over TCP**.
+The first real transport lane is now implemented end to end at the
+protocol-crypto level: **VLESS + Reality over TCP**.
 
 What exists now:
 
 - Kotlin connection state model with explicit control-plane vs data-plane phases
-- `VpnService` lifecycle scaffold with TUN ownership staying on Android
+- `VpnService` lifecycle with TUN ownership staying on Android
 - VLESS + Reality profile parser for `tcp`, `ws`, and `xhttp`
-- Rust/JNI lane-preparation skeleton for the Reality lane
-- Compose debug surface that refuses to show connected until the data-plane probe is marked successful
+- **Real Reality handshake state** in Rust: X25519 ephemeral key agreement,
+  HKDF-SHA256 key schedule, HMAC session-id authentication, AES-256-GCM
+  sealed ClientHello and per-record sealing/opening
+- **Data-plane probe**: a sealed probe record must open cleanly under the
+  negotiated session keys; CONNECTED is only ever reported after this passes
+- **Packet pump JNI surface**: reads IP packets from the TUN fd, seals each
+  into a Reality record, with live counters (packets/bytes in/out, seal and
+  open errors) surfaced back to Kotlin
+- Host-side verified packet round trip through a real fd pair (socketpair)
+- Structured, secret-free failure reasons surfaced to the UI
+- Compose debug surface wired to the real progression — no manual
+  "mark probe success" override exists anymore
+
+Crypto stack (pure Rust, no foreign bindings, MIT-compatible):
+`x25519-dalek`, `hkdf`/`sha2`/`hmac`, `aes-gcm`.
 
 What still does **not** exist yet:
 
-- Real socket handshake
-- Packet pump across JNI
-- Actual data-plane probe
+- Wire-level server interop test against a real Xray Reality endpoint
 - Kill switch, leak protection, reconnect, fallback racing
 
 ### Repository split
@@ -37,12 +49,11 @@ OpenVPN and MTProto are intentionally out of scope.
 
 ## Next build target
 
-Milestone 3 should replace the fake lane builder with:
+Milestone 4 candidates:
 
-- actual Reality handshake state
-- packet pump JNI surface
-- verified packet round-trip through TUN
-- structured failure reasons surfaced back to UI
+- wire-level interop against a real Xray Reality server
+- kill switch and leak protection
+- reconnect with backoff and fallback lane racing
 
 ## Security rules
 

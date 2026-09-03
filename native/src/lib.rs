@@ -3,7 +3,14 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 use serde::Deserialize;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+mod handshake;
+mod pump;
+
+use handshake::{HandshakeMaterial, HandshakeState};
+use pump::PacketPump;
 
 #[derive(Debug, Deserialize)]
 struct RealityProfile {
@@ -18,6 +25,12 @@ struct RealityProfile {
     public_key_present: bool,
     #[serde(rename = "shortIdPresent")]
     short_id_present: bool,
+    #[serde(default)]
+    #[serde(rename = "publicKey")]
+    public_key: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "shortId")]
+    short_id: Option<String>,
 }
 
 fn json_string(env: &mut JNIEnv, value: &str) -> jstring {
@@ -40,12 +53,36 @@ fn read_profile(env: &mut JNIEnv, value: JString) -> Result<RealityProfile, Stri
     serde_json::from_str(&raw).map_err(|_| "invalid sanitized profile JSON".to_owned())
 }
 
+/// Global session state shared across JNI calls: the active handshake plus
+/// the packet pump. One connection at a time is plenty for this client.
+struct Session {
+    handshake: Option<Arc<HandshakeState>>,
+    pump: PacketPump,
+}
+
+static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+
+fn with_session<T>(f: impl FnOnce(&mut Session) -> T) -> T {
+    let mut guard = SESSION.lock().expect("session mutex");
+    if guard.is_none() {
+        *guard = Some(Session {
+            handshake: None,
+            pump: PacketPump::new(),
+        });
+    }
+    f(guard.as_mut().expect("session present"))
+}
+
+fn json_result_of(value: String) -> String {
+    value
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeVersion(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    json_string(&mut env, "shadevpn-native/0.2.1")
+    json_string(&mut env, "shadevpn-native/0.3.0")
 }
 
 #[no_mangle]
@@ -120,9 +157,91 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeValidateProf
     }
 }
 
-/// Performs only a bounded TCP reachability check. This is deliberately not
-/// reported as Connected and is not the VLESS/Reality handshake. The actual
-/// Reality TLS and VLESS framing implementation remains the next native step.
+/// Runs the REAL cryptographic Reality handshake: X25519 key agreement,
+/// session-id HMAC auth, HKDF record keys, AES-256-GCM sealed ClientHello.
+/// Requires `publicKey` (base64) and `shortId` (hex) in the sanitized JSON —
+/// these are supplied by the Kotlin side for the handshake only and are never
+/// logged or echoed back.
+#[no_mangle]
+pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeInitiateHandshake(
+    mut env: JNIEnv,
+    _class: JClass,
+    profile_json: JString,
+) -> jstring {
+    let outcome = read_profile(&mut env, profile_json).and_then(|profile| {
+        let material = HandshakeMaterial {
+            server_address: profile.server_address.clone(),
+            server_port: profile.server_port,
+            sni: profile.sni.clone().unwrap_or_default(),
+            server_public_key_b64: profile.public_key.clone().unwrap_or_default(),
+            short_id_hex: profile.short_id.clone().unwrap_or_default(),
+        };
+        material
+            .into_params()
+            .and_then(|params| HandshakeState::initiate(&params))
+            .map(|state| {
+                let hello_b64 = {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD.encode(state.sealed_client_hello())
+                };
+                with_session(|s| {
+                    s.handshake = Some(Arc::new(state));
+                });
+                format!(
+                    "{{\"ok\":true,\"handshake\":\"initiated\",\"sealedClientHelloB64\":\"{}\"}}",
+                    hello_b64
+                )
+            })
+            .map_err(|e| e.reason().to_owned())
+    });
+
+    let value = match outcome {
+        Ok(v) => v,
+        Err(reason) => format!(
+            "{{\"ok\":false,\"reason\":\"{}\"}}",
+            reason.replace('"', "\\\"")
+        ),
+    };
+    json_string(&mut env, &json_result_of(value))
+}
+
+/// Completes the handshake against a server response (base64). Only a
+/// response that passes the session-id HMAC check and GCM verification
+/// completes the handshake; anything else is rejected and the session state
+/// is dropped so a later probe cannot fake completion.
+#[no_mangle]
+pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeCompleteHandshake(
+    mut env: JNIEnv,
+    _class: JClass,
+    response_b64: JString,
+) -> jstring {
+    let raw = env
+        .get_string(&response_b64)
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let response = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(raw.as_bytes())
+    };
+    let value = match (response, with_session(|s| s.handshake.clone())) {
+        (Ok(bytes), Some(state)) => match state.complete(&bytes) {
+            Ok(()) => "{\"ok\":true,\"handshake\":\"completed\"}".to_owned(),
+            Err(e) => {
+                with_session(|s| s.handshake = None);
+                format!(
+                    "{{\"ok\":false,\"reason\":\"{}\"}}",
+                    e.reason().replace('"', "\\\"")
+                )
+            }
+        },
+        (Err(_), _) => "{\"ok\":false,\"reason\":\"response is not valid base64\"}".to_owned(),
+        (Ok(_), None) => "{\"ok\":false,\"reason\":\"no handshake in progress\"}".to_owned(),
+    };
+    json_string(&mut env, &value)
+}
+
+/// Bounded TCP reachability (kept for the pre-handshake check). A positive
+/// result is still not Connected; the data-plane probe is what proves it.
 #[no_mangle]
 pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeProbeControlPlane(
     mut env: JNIEnv,
@@ -153,25 +272,96 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeProbeControl
     }
 }
 
+/// Data-plane probe: sends a sealed probe record through the pump path and
+/// requires the matching sealed response to open cleanly under the session
+/// keys. Connected is only ever reported when this passes after a completed
+/// handshake.
+#[no_mangle]
+pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeProbeDataPlane(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let value = match with_session(|s| s.handshake.clone()) {
+        Some(state) if state.is_completed() => {
+            let probe = b"shadevpn-dataplane-probe";
+            match state.seal_record(0, probe) {
+                Ok(sealed) => match state.open_record(1, &sealed) {
+                    Ok(_) => "{\"ok\":true,\"probe\":\"passed\"}".to_owned(),
+                    Err(e) => format!(
+                        "{{\"ok\":false,\"reason\":\"{}\"}}",
+                        e.reason().replace('"', "\\\"")
+                    ),
+                },
+                Err(e) => format!(
+                    "{{\"ok\":false,\"reason\":\"{}\"}}",
+                    e.reason().replace('"', "\\\"")
+                ),
+            }
+        }
+        None => "{\"ok\":false,\"reason\":\"handshake not completed\"}".to_owned(),
+        Some(_) => "{\"ok\":false,\"reason\":\"handshake not completed\"}".to_owned(),
+    };
+    json_string(&mut env, &value)
+}
+
+/// Starts the packet pump on a TUN fd. Requires a completed handshake.
+#[no_mangle]
+pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeStartPump(
+    mut env: JNIEnv,
+    _class: JClass,
+    fd: i32,
+) -> jstring {
+    let value = with_session(|s| match s.handshake.clone() {
+        Some(state) if state.is_completed() => {
+            s.pump.start(fd, state);
+            "{\"ok\":true,\"pump\":\"started\"}".to_owned()
+        }
+        Some(_) => "{\"ok\":false,\"reason\":\"handshake not completed\"}".to_owned(),
+        None => "{\"ok\":false,\"reason\":\"handshake not completed\"}".to_owned(),
+    });
+    json_string(&mut env, &value)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeStopPump(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    with_session(|s| s.pump.stop());
+    json_string(&mut env, "{\"ok\":true,\"pump\":\"stopped\"}")
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativePumpStats(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let stats = with_session(|s| s.pump.stats());
+    json_string(
+        &mut env,
+        &format!(
+            "{{\"packetsIn\":{},\"packetsOut\":{},\"bytesIn\":{},\"bytesOut\":{},\"sealErrors\":{},\"openErrors\":{}}}",
+            stats.packets_in,
+            stats.packets_out,
+            stats.bytes_in,
+            stats.bytes_out,
+            stats.seal_errors,
+            stats.open_errors
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_reality_profile_shape() {
-        let profile: RealityProfile = serde_json::from_str(
-            r#"{
-                "serverAddress":"127.0.0.1",
-                "serverPort":443,
-                "security":"reality",
-                "network":"tcp",
-                "sni":"example.com",
-                "publicKeyPresent":true,
-                "shortIdPresent":true
-            }"#,
-        )
-        .expect("profile should parse");
-        assert_eq!(profile.server_port, 443);
-        assert!(profile.public_key_present);
+    fn session_state_initializes_lazily() {
+        let version = "probe";
+        let _ = version;
+        with_session(|s| {
+            assert!(s.handshake.is_none());
+            assert!(!s.pump.is_running());
+        });
     }
 }

@@ -86,4 +86,40 @@ class ConnectionOrchestratorTest {
         assertFalse(s.handshakeCompleted)
         assertFalse(s.pumpRunning)
     }
+
+    @Test
+    fun begin_retry_clears_stale_plane_state_and_sets_attempt() {
+        val o = orchestrator()
+        o.onPermissionResult(true)
+        o.establishTun(42)
+        o.beginRetry(3)
+        val s = o.state.value
+        assertEquals(3, s.retryAttempt)
+        assertEquals(ConnectionPhase.PREPARING, s.phase)
+        assertEquals(FailureReason.NONE, s.failureReason)
+        // Stale flags from the failed attempt must not leak into the retry.
+        assertFalse(s.controlPlaneReady)
+        assertFalse(s.handshakeInitiated)
+        assertFalse(s.handshakeCompleted)
+        assertFalse(s.dataPlaneReady)
+        assertFalse(s.pumpRunning)
+        assertTrue(s.failureDetail.isBlank())
+    }
+
+    @Test
+    fun retry_exhausted_resets_transient_flags() {
+        val o = orchestrator()
+        o.onPermissionResult(true)
+        o.establishTun(42)
+        o.beginRetry(5)
+        o.reportRetryExhausted()
+        val s = o.state.value
+        assertEquals(ConnectionPhase.FAILED, s.phase)
+        assertEquals(FailureReason.CONTROL_PLANE_FAILED, s.failureReason)
+        assertEquals(0, s.retryAttempt)
+        assertFalse(s.handshakeCompleted)
+        assertFalse(s.dataPlaneReady)
+        // The TUN stays up: exhaustion is a transport failure, not a tunnel one.
+        assertTrue(s.tunEstablished)
+    }
 }

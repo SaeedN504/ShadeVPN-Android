@@ -25,6 +25,9 @@ import kotlin.concurrent.thread
 class ShadeVpnService : VpnService() {
     private val orchestrator = ConnectionOrchestrator()
     private var tunInterface: ParcelFileDescriptor? = null
+
+    /** Guards the connect/retry loop against stop/re-attach races. */
+    @Volatile
     private var connectGeneration = 0
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -67,6 +70,12 @@ class ShadeVpnService : VpnService() {
             .addDnsServer("1.1.1.1")
             .addRoute("0.0.0.0", 0)
         if (blockIpv6) {
+            // A global-scope address is required for apps to actually source
+            // v6 traffic into the TUN (source selection rejects ULA for
+            // global destinations). 2001:db8::/32 is reserved documentation
+            // space — never routable on the real internet, and the pump
+            // blackholes everything that arrives on it anyway.
+            builder.addAddress("2001:db8:6b6b::2", 128)
             builder.addRoute("2000::", 3)
         }
         runCatching { builder.addDisallowedApplication(android.os.Process.myUid()) }
@@ -87,7 +96,7 @@ class ShadeVpnService : VpnService() {
         // Connect sequence, with reconnect-with-backoff around it.
         val backoff = BackoffPolicy()
         while (orchestrator.state.value.tunEstablished) {
-            val attemptResult = attemptConnect(fd, blockIpv6)
+            val attemptResult = attemptConnect(fd, blockIpv6, generation)
             if (attemptResult) return // connected (pump running) or fatal stop
 
             if (generation != connectGeneration) return // superseded or stopped
@@ -105,7 +114,7 @@ class ShadeVpnService : VpnService() {
     }
 
     /** One full connect attempt. True = terminal (connected or fatal). */
-    private fun attemptConnect(fd: Int, blockIpv6: Boolean): Boolean {
+    private fun attemptConnect(fd: Int, blockIpv6: Boolean, generation: Int): Boolean {
         // 1. Lane validation (sanitized payload only)
         orchestrator.buildRealityLane().onFailure {
             orchestrator.fail(FailureReason.JNI_ERROR, "Failed to build Reality lane")
@@ -122,7 +131,10 @@ class ShadeVpnService : VpnService() {
         // 4. Data-plane probe: natively refuses to pass without live keys.
         orchestrator.runDataPlaneProbe().getOrElse { return false }
 
-        // 5. Data plane proven — start the pump with the leak shield.
+        // 5. Data plane proven. Re-check the generation immediately before
+        // starting the pump: a stop or re-attach must never leave a pump
+        // running on a TUN the service has torn down.
+        if (generation != connectGeneration) return true
         orchestrator.startPump(fd, blockIpv6).getOrElse {
             stopSelf()
             return true

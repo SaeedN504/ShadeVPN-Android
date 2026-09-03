@@ -21,8 +21,10 @@ class BackoffPolicy(
     /** Next delay in ms, or null when the retry budget is exhausted. */
     fun nextDelayMs(): Long? {
         if (attempt >= maxAttempts) return null
+        // Shift is capped so baseMs * 2^attempt cannot overflow Long for
+        // pathological base values.
         val exp = baseMs * (1L shl attempt.coerceAtMost(30))
-        val capped = exp.coerceAtMost(maxDelayMs)
+        val capped = exp.coerceAtMost(maxDelayMs).coerceAtLeast(0)
         attempt++
         // nextDouble() is in [0,1), so this is uniform in [0, capped) and
         // cannot overflow like nextLong() * capped would.

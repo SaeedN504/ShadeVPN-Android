@@ -52,4 +52,18 @@ class BackoffPolicyTest {
         val policy = BackoffPolicy(baseMs = 0, maxDelayMs = 100, maxAttempts = 2)
         assertEquals(0L, policy.nextDelayMs())
     }
+
+    @Test
+    fun huge_base_does_not_overflow() {
+        // 2^30 shift against a near-Long-max base must not wrap negative.
+        val policy = BackoffPolicy(baseMs = Long.MAX_VALUE / 2, maxDelayMs = 60_000, maxAttempts = 5, random = Random(1))
+        val d = policy.nextDelayMs()!!
+        assertTrue("delay $d must be within [0, maxDelay]", d in 0..60_000)
+    }
+
+    @Test
+    fun negative_max_delay_clamps_to_zero() {
+        val policy = BackoffPolicy(baseMs = 100, maxDelayMs = -1, maxAttempts = 1)
+        assertEquals(0L, policy.nextDelayMs())
+    }
 }

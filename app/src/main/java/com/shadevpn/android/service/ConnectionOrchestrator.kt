@@ -177,6 +177,7 @@ class ConnectionOrchestrator {
                 copy(
                     phase = ConnectionPhase.CONNECTED,
                     dataPlaneReady = true,
+                    retryAttempt = 0,
                     statusLine = "Connected — data-plane probe passed",
                     failureReason = FailureReason.NONE
                 )
@@ -215,14 +216,18 @@ class ConnectionOrchestrator {
         }
     }
 
-    /** Starts a retry: reports attempt N and keeps the tunnel scaffolding honest. */
+    /** Starts a retry: reports attempt N and clears stale plane state. */
     fun beginRetry(attempt: Int) = mutate {
         copy(
             phase = ConnectionPhase.PREPARING,
             statusLine = "Reconnect attempt $attempt",
             failureReason = FailureReason.NONE,
-            dataPlaneReady = false,
+            failureDetail = "",
+            retryAttempt = attempt,
+            controlPlaneReady = false,
+            handshakeInitiated = false,
             handshakeCompleted = false,
+            dataPlaneReady = false,
             pumpRunning = false
         )
     }
@@ -231,7 +236,10 @@ class ConnectionOrchestrator {
         copy(
             phase = ConnectionPhase.FAILED,
             statusLine = "Reconnect abandoned after retries",
-            failureReason = FailureReason.CONTROL_PLANE_FAILED
+            failureReason = FailureReason.CONTROL_PLANE_FAILED,
+            retryAttempt = 0,
+            handshakeCompleted = false,
+            dataPlaneReady = false
         )
     }
 

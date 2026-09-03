@@ -2,10 +2,11 @@
 
 Android client and native transport layer for ShadeVPN.
 
-## Milestone 3
+## Milestone 4a
 
-The first real transport lane is now implemented end to end at the
-protocol-crypto level: **VLESS + Reality over TCP**.
+The first real transport lane is implemented at the protocol-crypto level
+(**VLESS + Reality over TCP**, milestone 3), and the tunnel now has
+leak protection and reconnect resilience.
 
 What exists now:
 
@@ -17,13 +18,16 @@ What exists now:
   sealed ClientHello and per-record sealing/opening
 - **Data-plane probe**: a sealed probe record must open cleanly under the
   negotiated session keys; CONNECTED is only ever reported after this passes
-- **Packet pump JNI surface**: reads IP packets from the TUN fd, seals each
-  into a Reality record, with live counters (packets/bytes in/out, seal and
-  open errors) surfaced back to Kotlin
-- Host-side verified packet round trip through a real fd pair (socketpair)
+- **Packet pump JNI surface** with per-session record sequence, reading IP
+  packets from the TUN fd and sealing each into a Reality record
+- **Leak shield**: the app's own UID is excluded from the TUN (no
+  self-routing loop); with IPv6 blocking on, a `2000::/3` route is still
+  advertised so v6 traffic is captured and blackholed by the pump, with a
+  live `droppedPackets` counter
+- **Reconnect with exponential backoff and full jitter** (5 attempts,
+  0.5s–15s), cancelled by disconnect/revocation
 - Structured, secret-free failure reasons surfaced to the UI
-- Compose debug surface wired to the real progression — no manual
-  "mark probe success" override exists anymore
+- Host-side verified packet round trip through a real fd pair (socketpair)
 
 Crypto stack (pure Rust, no foreign bindings, MIT-compatible):
 `x25519-dalek`, `hkdf`/`sha2`/`hmac`, `aes-gcm`.
@@ -31,7 +35,9 @@ Crypto stack (pure Rust, no foreign bindings, MIT-compatible):
 What still does **not** exist yet:
 
 - Wire-level server interop test against a real Xray Reality endpoint
-- Kill switch, leak protection, reconnect, fallback racing
+- Always-on/kill-switch enforcement (the settings deep-link exists;
+  programmatic verification of Android's lockdown mode is on-device work)
+- Fallback lane racing (MASQUE H2, Shadowsocks 2022)
 
 ### Repository split
 
@@ -49,11 +55,11 @@ OpenVPN and MTProto are intentionally out of scope.
 
 ## Next build target
 
-Milestone 4 candidates:
+Milestone 4b candidates:
 
 - wire-level interop against a real Xray Reality server
-- kill switch and leak protection
-- reconnect with backoff and fallback lane racing
+- fallback lane racing (MASQUE H2 as proven backup)
+- on-device soak test of reconnect under real network loss
 
 ## Security rules
 

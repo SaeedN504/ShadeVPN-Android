@@ -82,7 +82,7 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeVersion(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    json_string(&mut env, "shadevpn-native/0.3.0")
+    json_string(&mut env, "shadevpn-native/0.4.0")
 }
 
 #[no_mangle]
@@ -322,6 +322,28 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeStartPump(
     json_string(&mut env, &value)
 }
 
+/// Starts the packet pump with leak-shield configuration. `block_ipv6`
+/// blackholes IPv6 inside the tunnel so v6 traffic can never escape the
+/// VPN while an IPv6 route is still advertised to catch it.
+#[no_mangle]
+pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeStartPumpWithConfig(
+    mut env: JNIEnv,
+    _class: JClass,
+    fd: i32,
+    block_ipv6: bool,
+) -> jstring {
+    let value = with_session(|s| match s.handshake.clone() {
+        Some(state) if state.is_completed() => {
+            s.pump
+                .start_with_config(fd, state, pump::PumpConfig { block_ipv6 });
+            "{\"ok\":true,\"pump\":\"started\"}".to_owned()
+        }
+        Some(_) => "{\"ok\":false,\"reason\":\"handshake not completed\"}".to_owned(),
+        None => "{\"ok\":false,\"reason\":\"handshake not completed\"}".to_owned(),
+    });
+    json_string(&mut env, &value)
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeStopPump(
     mut env: JNIEnv,
@@ -340,13 +362,14 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativePumpStats(
     json_string(
         &mut env,
         &format!(
-            "{{\"packetsIn\":{},\"packetsOut\":{},\"bytesIn\":{},\"bytesOut\":{},\"sealErrors\":{},\"openErrors\":{}}}",
+            "{{\"packetsIn\":{},\"packetsOut\":{},\"bytesIn\":{},\"bytesOut\":{},\"sealErrors\":{},\"openErrors\":{},\"droppedPackets\":{}}}",
             stats.packets_in,
             stats.packets_out,
             stats.bytes_in,
             stats.bytes_out,
             stats.seal_errors,
-            stats.open_errors
+            stats.open_errors,
+            stats.dropped_packets
         ),
     )
 }

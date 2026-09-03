@@ -36,6 +36,12 @@ object NativeBridge {
     /** Starts the packet pump on the TUN fd. Requires a completed handshake. */
     external fun nativeStartPump(fd: Int): String
 
+    /**
+     * Starts the pump with the leak shield: `blockIpv6` blackholes IPv6
+     * packets inside the tunnel so they can never bypass the VPN.
+     */
+    external fun nativeStartPumpWithConfig(fd: Int, blockIpv6: Boolean): String
+
     external fun nativeStopPump(): String
 
     external fun nativePumpStats(): String

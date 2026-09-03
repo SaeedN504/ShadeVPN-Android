@@ -52,6 +52,7 @@ data class ConnectionSnapshot(
     val handshakeInitiated: Boolean = false,
     val handshakeCompleted: Boolean = false,
     val pumpRunning: Boolean = false,
+    val retryAttempt: Int = 0,
     val nativeVersion: String = "unavailable",
     val selectedProfile: VlessProfile? = null
 )

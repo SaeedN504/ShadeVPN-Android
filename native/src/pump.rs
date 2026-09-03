@@ -24,12 +24,38 @@ pub struct PumpStats {
     pub bytes_out: u64,
     pub seal_errors: u64,
     pub open_errors: u64,
+    /// IPv6 packets deliberately blackholed inside the tunnel (leak shield).
+    pub dropped_packets: u64,
+}
+
+/// Pump behavior knobs.
+#[derive(Debug, Clone, Copy)]
+pub struct PumpConfig {
+    /// Drop (blackhole) all IPv6 packets read from the TUN instead of
+    /// sealing them. The pump is the only egress from the TUN, so dropping
+    /// here means IPv6 never reaches the underlying network while the VPN
+    /// still advertises an IPv6 route to catch that traffic.
+    pub block_ipv6: bool,
+}
+
+impl Default for PumpConfig {
+    fn default() -> Self {
+        PumpConfig { block_ipv6: false }
+    }
+}
+
+/// IP version nibble of an IPv4/IPv6 header.
+fn ip_version(buf: &[u8]) -> u8 {
+    buf.first().map(|b| b >> 4).unwrap_or(0)
 }
 
 struct Inner {
     running: AtomicBool,
     stop: AtomicBool,
     stats: Mutex<PumpStats>,
+    /// Per-session record sequence: monotonic, starts at 0 per pump, so
+    /// nonces are never reused within a session regardless of other pumps.
+    seq: AtomicU64,
 }
 
 impl Inner {
@@ -52,6 +78,7 @@ impl PacketPump {
                 running: AtomicBool::new(false),
                 stop: AtomicBool::new(false),
                 stats: Mutex::new(PumpStats::default()),
+                seq: AtomicU64::new(0),
             }),
         }
     }
@@ -60,6 +87,10 @@ impl PacketPump {
     /// `fd` must remain valid for the pump's lifetime; the caller (Android)
     /// owns and closes it.
     pub fn start(&self, fd: RawFd, handshake: Arc<HandshakeState>) {
+        self.start_with_config(fd, handshake, PumpConfig::default());
+    }
+
+    pub fn start_with_config(&self, fd: RawFd, handshake: Arc<HandshakeState>, config: PumpConfig) {
         if self.inner.running.swap(true, Ordering::SeqCst) {
             return; // already running
         }
@@ -80,7 +111,14 @@ impl PacketPump {
                             s.packets_in += 1;
                             s.bytes_in += n as u64;
                         });
-                        match handshake.seal_record(seq_from(&inner), &buf[..n]) {
+                        // Leak shield: blackhole IPv6 inside the tunnel.
+                        if config.block_ipv6 && ip_version(&buf[..n]) == 6 {
+                            Inner::bump(&inner.stats, |s| s.dropped_packets += 1);
+                            continue;
+                        }
+                        match handshake
+                            .seal_record(inner.seq.fetch_add(1, Ordering::SeqCst), &buf[..n])
+                        {
                             Ok(sealed) => {
                                 if sink.write_all(&sealed).is_ok() {
                                     Inner::bump(&inner.stats, |s| {
@@ -121,12 +159,6 @@ impl Default for PacketPump {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn seq_from(_inner: &Inner) -> u64 {
-    // Per-record sequence derived from outbound counter; monotonic, never reused.
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::SeqCst)
 }
 
 /// Read/write halves over a raw fd using libc read(2)/write(2). Split so the
@@ -277,5 +309,102 @@ mod tests {
         pump.start(sock_a.as_raw_fd(), handshake); // second call is a no-op
         assert!(first_running);
         pump.stop();
+    }
+
+    /// A minimal valid-shape IPv6 header (version nibble 6).
+    fn ipv6_packet(len: usize) -> Vec<u8> {
+        let mut pkt = vec![0u8; len.max(40)];
+        pkt[0] = 0x60; // version 6, traffic class 0
+        pkt[4] = 0x00; // payload length 0
+        pkt[6] = 0x11; // next header: UDP
+        pkt[7] = 0x40; // hop limit 64
+        pkt
+    }
+
+    fn wait_for_output(sock: &mut UnixStream, timeout: std::time::Duration) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut out = Vec::new();
+        while std::time::Instant::now() < deadline {
+            sock.set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                .unwrap();
+            let mut tmp = vec![0u8; MAX_PACKET];
+            match sock.read(&mut tmp) {
+                Ok(n) if n > 0 => out.extend_from_slice(&tmp[..n]),
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        out
+    }
+
+    /// Leak shield: with block_ipv6, IPv6 packets must be blackholed inside
+    /// the tunnel (never sealed, never written out) and counted.
+    #[test]
+    fn ipv6_packets_are_dropped_when_blocking() {
+        let (sock_a, mut sock_b) = UnixStream::pair().expect("socketpair");
+        let handshake = test_handshake();
+        let pump = PacketPump::new();
+        pump.start_with_config(
+            sock_a.as_raw_fd(),
+            Arc::clone(&handshake),
+            PumpConfig { block_ipv6: true },
+        );
+
+        sock_b.write_all(&ipv6_packet(48)).expect("write v6");
+        sock_b.flush().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            pump.stats().dropped_packets,
+            1,
+            "v6 packet must be counted as dropped"
+        );
+        assert!(
+            pump.stats().packets_out == 0,
+            "v6 packet must never be sealed out"
+        );
+
+        // The tunnel still works for v4 afterwards.
+        let payload: Vec<u8> = [0x45u8, 0, 0, 0].iter().copied().chain(0u8..=9).collect();
+        sock_b.write_all(&payload).expect("write v4");
+        sock_b.flush().unwrap();
+        let out = wait_for_output(&mut sock_b, std::time::Duration::from_secs(3));
+        assert!(!out.is_empty(), "v4 traffic must still flow");
+        let opened = handshake
+            .open_local_record(0, &out)
+            .expect("open v4 record");
+        assert_eq!(opened, payload);
+
+        assert_eq!(pump.stats().dropped_packets, 1);
+        assert_eq!(pump.stats().packets_in, 2);
+        pump.stop();
+    }
+
+    /// Without the flag, IPv6 packets flow like any other packet (no leak
+    /// logic surprise — the knob is opt-in from Kotlin).
+    #[test]
+    fn ipv6_packets_flow_when_not_blocking() {
+        let (sock_a, mut sock_b) = UnixStream::pair().expect("socketpair");
+        let handshake = test_handshake();
+        let pump = PacketPump::new();
+        pump.start(sock_a.as_raw_fd(), Arc::clone(&handshake));
+
+        let pkt = ipv6_packet(48);
+        sock_b.write_all(&pkt).expect("write v6");
+        sock_b.flush().unwrap();
+        let out = wait_for_output(&mut sock_b, std::time::Duration::from_secs(3));
+        assert!(!out.is_empty(), "v6 must be sealed when blocking is off");
+        let opened = handshake
+            .open_local_record(0, &out)
+            .expect("open v6 record");
+        assert_eq!(opened, pkt);
+        assert_eq!(pump.stats().dropped_packets, 0);
+        pump.stop();
+    }
+
+    #[test]
+    fn ip_version_detects_v4_and_v6() {
+        assert_eq!(ip_version(&[0x45, 0, 0]), 4);
+        assert_eq!(ip_version(&[0x60, 0, 0]), 6);
+        assert_eq!(ip_version(&[]), 0);
     }
 }

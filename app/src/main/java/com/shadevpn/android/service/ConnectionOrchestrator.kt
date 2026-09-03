@@ -194,12 +194,16 @@ class ConnectionOrchestrator {
     }
 
     /** Starts the native packet pump on the TUN fd. Requires a completed handshake. */
-    fun startPump(fd: Int): Result<Unit> {
+    fun startPump(fd: Int, blockIpv6: Boolean = false): Result<Unit> {
         return runCatching {
-            val response = JSONObject(NativeBridge.nativeStartPump(fd))
+            val response = if (blockIpv6) {
+                JSONObject(NativeBridge.nativeStartPumpWithConfig(fd, true))
+            } else {
+                JSONObject(NativeBridge.nativeStartPump(fd))
+            }
             require(response.optBoolean("ok", false)) { response.optString("reason", "pump start rejected") }
         }.onSuccess {
-            mutate { copy(pumpRunning = true, statusLine = "Packet pump running") }
+            mutate { copy(pumpRunning = true, statusLine = "Packet pump running${if (blockIpv6) " (IPv6 blocked)" else ""}") }
         }.onFailure {
             mutate {
                 copy(
@@ -209,6 +213,30 @@ class ConnectionOrchestrator {
                 )
             }
         }
+    }
+
+    /** Starts a retry: reports attempt N and keeps the tunnel scaffolding honest. */
+    fun beginRetry(attempt: Int) = mutate {
+        copy(
+            phase = ConnectionPhase.PREPARING,
+            statusLine = "Reconnect attempt $attempt",
+            failureReason = FailureReason.NONE,
+            dataPlaneReady = false,
+            handshakeCompleted = false,
+            pumpRunning = false
+        )
+    }
+
+    fun reportRetryExhausted() = mutate {
+        copy(
+            phase = ConnectionPhase.FAILED,
+            statusLine = "Reconnect abandoned after retries",
+            failureReason = FailureReason.CONTROL_PLANE_FAILED
+        )
+    }
+
+    fun reportRetryDelay(attempt: Int, delayMs: Long) = mutate {
+        copy(statusLine = "Reconnecting in ${delayMs}ms (attempt ${attempt + 1})")
     }
 
     fun stopPump() {

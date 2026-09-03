@@ -4,11 +4,13 @@ import android.app.Activity
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,13 +22,16 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -55,12 +60,12 @@ class MainActivity : ComponentActivity() {
                 state = state,
                 onPrepare = { requestVpnPermission() },
                 onLoadProfile = { raw -> orchestrator.loadProfile(raw) },
-                onConnect = { profile ->
+                onConnect = { profile, blockIpv6 ->
                     scope.launch {
                         val ok = orchestrator.loadProfile(profile).isSuccess &&
                             orchestrator.state.value.permissionGranted
                         if (ok) {
-                            ShadeVpnServiceController.start(this@MainActivity, profile)
+                            ShadeVpnServiceController.start(this@MainActivity, profile, blockIpv6)
                         }
                     }
                 },
@@ -69,6 +74,9 @@ class MainActivity : ComponentActivity() {
                 },
                 onProbeDataPlane = {
                     scope.launch(Dispatchers.IO) { orchestrator.runDataPlaneProbe() }
+                },
+                onOpenVpnSettings = {
+                    startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
                 },
                 onStop = {
                     orchestrator.stopPump()
@@ -94,14 +102,16 @@ private fun ShadeVpnApp(
     state: ConnectionSnapshot,
     onPrepare: () -> Unit,
     onLoadProfile: (String) -> Result<*>,
-    onConnect: (String) -> Unit,
+    onConnect: (String, Boolean) -> Unit,
     onProbeControlPlane: () -> Unit,
     onProbeDataPlane: () -> Unit,
+    onOpenVpnSettings: () -> Unit,
     onStop: () -> Unit
 ) {
     var rawProfile by remember {
         mutableStateOf("vless://00000000-0000-0000-0000-000000000000@example.com:443?security=reality&type=tcp&sni=cdn.example.com&pbk=publicKey&sid=01ab#ShadeVPN%20Reality")
     }
+    var blockIpv6 by remember { mutableStateOf(true) }
 
     MaterialTheme {
         Scaffold { padding -> Column(
@@ -114,7 +124,7 @@ private fun ShadeVpnApp(
             ) {
                 Text("ShadeVPN", style = MaterialTheme.typography.headlineLarge)
                 Spacer(Modifier.height(8.dp))
-                Text("Milestone 3: real Reality handshake, data-plane probe, packet pump")
+                Text("Milestone 4a: leak protection + reconnect resilience")
                 Spacer(Modifier.height(20.dp))
                 StatusCard(state)
                 Spacer(Modifier.height(20.dp))
@@ -131,8 +141,16 @@ private fun ShadeVpnApp(
                 Spacer(Modifier.height(8.dp))
                 Button(onClick = { onLoadProfile(rawProfile) }, modifier = Modifier.fillMaxWidth()) { Text("2. Parse VLESS + Reality profile") }
                 Spacer(Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Block IPv6 (leak shield)", modifier = Modifier.weight(1f))
+                    Switch(checked = blockIpv6, onCheckedChange = { blockIpv6 = it })
+                }
+                Spacer(Modifier.height(4.dp))
                 Button(
-                    onClick = { onConnect(rawProfile) },
+                    onClick = { onConnect(rawProfile, blockIpv6) },
                     enabled = state.selectedProfile != null && state.permissionGranted,
                     modifier = Modifier.fillMaxWidth()
                 ) { Text("3. Connect (handshake + probe + pump)") }
@@ -150,6 +168,10 @@ private fun ShadeVpnApp(
                 ) { Text("Run data-plane probe") }
                 Spacer(Modifier.height(8.dp))
                 Button(onClick = onStop, modifier = Modifier.fillMaxWidth()) { Text("Disconnect") }
+                Spacer(Modifier.height(4.dp))
+                TextButton(onClick = onOpenVpnSettings, modifier = Modifier.fillMaxWidth()) {
+                    Text("Always-on / lockdown VPN settings")
+                }
             }
         }
     }
@@ -171,6 +193,9 @@ private fun StatusCard(state: ConnectionSnapshot) {
         Text("Handshake completed: ${state.handshakeCompleted}")
         Text("Data probe: ${state.dataPlaneReady}")
         Text("Pump: ${state.pumpRunning}")
+        if (state.retryAttempt > 0) {
+            Text("Retry attempt: ${state.retryAttempt}")
+        }
         Spacer(Modifier.height(10.dp))
         Text(
             text = when (state.phase) {

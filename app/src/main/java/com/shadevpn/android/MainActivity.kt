@@ -38,14 +38,15 @@ import androidx.compose.ui.unit.dp
 import com.shadevpn.android.model.ConnectionPhase
 import com.shadevpn.android.model.ConnectionSnapshot
 import com.shadevpn.android.model.FailureReason
-import com.shadevpn.android.service.ConnectionOrchestrator
+import com.shadevpn.android.service.ShadeConnection
 import com.shadevpn.android.service.ShadeVpnServiceController
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
-    private val orchestrator = ConnectionOrchestrator()
+    // Same instance the service drives — the UI mirrors live transport state.
+    private val orchestrator get() = ShadeConnection.orchestrator
     private val scope = CoroutineScope(Dispatchers.Main)
 
     private val vpnPermissionLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->

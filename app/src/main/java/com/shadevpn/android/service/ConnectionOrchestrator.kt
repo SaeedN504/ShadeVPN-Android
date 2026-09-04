@@ -281,7 +281,16 @@ class ConnectionOrchestrator {
         )
     }
 
+    /**
+     * Atomic compare-and-set update loop: the service (connect thread,
+     * disconnect thread) and the UI can mutate concurrently, so a plain
+     * read-modify-write could lose updates. Retries until the CAS wins.
+     */
     private fun mutate(block: ConnectionSnapshot.() -> ConnectionSnapshot) {
-        _state.value = _state.value.block()
+        while (true) {
+            val current = _state.value
+            val updated = current.block()
+            if (_state.compareAndSet(current, updated)) return
+        }
     }
 }

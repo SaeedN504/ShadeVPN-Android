@@ -5,7 +5,7 @@ import android.net.VpnService
 import android.os.ParcelFileDescriptor
 import com.shadevpn.android.model.FailureReason
 import com.shadevpn.android.service.BackoffPolicy
-import com.shadevpn.android.service.ConnectionOrchestrator
+import com.shadevpn.android.service.ShadeConnection
 import com.shadevpn.android.service.ShadeVpnServiceController
 import kotlin.concurrent.thread
 
@@ -23,7 +23,8 @@ import kotlin.concurrent.thread
  * and full jitter; disconnect (or revocation) cancels retries.
  */
 class ShadeVpnService : VpnService() {
-    private val orchestrator = ConnectionOrchestrator()
+    // Process-wide instance: the UI observes the state this service drives.
+    private val orchestrator get() = ShadeConnection.orchestrator
     private var tunInterface: ParcelFileDescriptor? = null
 
     /** Guards the connect/retry loop against stop/re-attach races. */

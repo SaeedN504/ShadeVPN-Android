@@ -12,12 +12,19 @@ import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
 
 /**
- * Milestone 3: drives the REAL transport progression —
- * TUN -> control-plane reachability -> Reality handshake (X25519 + HMAC
- * session auth + AES-GCM records) -> data-plane probe -> packet pump.
+ * Drives the REAL transport progression —
+ * TUN -> control-plane reachability -> wire tunnel establishment (TCP +
+ * X25519 + HMAC session auth + sealed ClientHello) -> server-response
+ * authentication -> data-plane probe over the live tunnel -> tunnel pump.
  * CONNECTED is only ever reported after the data-plane probe passes.
  */
 class ConnectionOrchestrator {
+
+    /**
+     * Server response returned by the wire handshake, awaiting
+     * [completeHandshake]. Held only in memory, never logged.
+     */
+    private var pendingServerResponseB64: String? = null
     private val _state = MutableStateFlow(
         ConnectionSnapshot(nativeVersion = runCatching { NativeBridge.nativeVersion() }.getOrDefault("unavailable"))
     )
@@ -104,27 +111,39 @@ class ConnectionOrchestrator {
     }
 
     /**
-     * Real Reality handshake initiation. Key material (publicKey/shortId) is
-     * serialized into the handshake payload only — never into status lines.
+     * Real tunnel establishment: TCP connect plus the full cryptographic
+     * Reality handshake over the wire (X25519, HKDF, HMAC session auth,
+     * sealed ClientHello). The native layer returns the server's response
+     * WITHOUT auto-completing; Kotlin must feed it back through
+     * [completeHandshake] so this state machine governs the progression.
+     *
+     * Key material (publicKey/shortId) is serialized into the handshake
+     * payload only — never into status lines or logs.
      */
-    fun initiateHandshake(): Result<Unit> {
+    fun connectTunnel(): Result<Unit> {
         val profile = state.value.selectedProfile ?: return Result.failure(IllegalStateException("No profile selected"))
         return runCatching {
-            val response = JSONObject(NativeBridge.nativeInitiateHandshake(VlessProfileParser.toHandshakeJson(profile)))
-            require(response.optBoolean("ok", false)) { response.optString("reason", "handshake rejected") }
+            val response = JSONObject(NativeBridge.nativeConnectTunnel(VlessProfileParser.toHandshakeJson(profile)))
+            require(response.optBoolean("ok", false)) { response.optString("reason", "tunnel connection rejected") }
+            val responseB64 = response.optString("serverResponseB64")
+            require(responseB64.isNotBlank()) { "server response missing from tunnel payload" }
+            pendingServerResponseB64 = responseB64
         }.onSuccess {
             mutate {
                 copy(
                     handshakeInitiated = true,
                     controlPlaneReady = true,
-                    statusLine = "Reality handshake initiated (X25519 + session auth)"
+                    statusLine = "Reality hello sent, session awaiting authentication"
                 )
             }
         }.onFailure {
+            // Drop any stale tunnel state (socket + keys) so a retry starts clean.
+            runCatching { NativeBridge.nativeDisconnectTunnel() }
+            pendingServerResponseB64 = null
             mutate {
                 copy(
                     phase = ConnectionPhase.FAILED,
-                    statusLine = "Reality handshake failed",
+                    statusLine = "Reality tunnel connection failed",
                     failureReason = FailureReason.CONTROL_PLANE_FAILED,
                     failureDetail = it.message ?: "",
                     handshakeInitiated = false
@@ -134,15 +153,20 @@ class ConnectionOrchestrator {
     }
 
     /**
-     * Completes the handshake with the server response (base64). A rejected
-     * response drops the session keys natively; the UI can never mark the
+     * Completes the handshake with the server response (base64). Defaults to
+     * the response captured by [connectTunnel]. A rejected response tears the
+     * session down natively (keys AND socket); the UI can never mark the
      * connection as complete after this.
      */
-    fun completeHandshake(serverResponseB64: String): Result<Unit> {
+    fun completeHandshake(serverResponseB64: String? = pendingServerResponseB64): Result<Unit> {
+        if (serverResponseB64.isNullOrBlank()) {
+            return Result.failure(IllegalStateException("No server response to authenticate"))
+        }
         return runCatching {
             val response = JSONObject(NativeBridge.nativeCompleteHandshake(serverResponseB64))
             require(response.optBoolean("ok", false)) { response.optString("reason", "session auth rejected") }
         }.onSuccess {
+            pendingServerResponseB64 = null
             mutate {
                 copy(
                     handshakeCompleted = true,
@@ -151,6 +175,7 @@ class ConnectionOrchestrator {
                 )
             }
         }.onFailure {
+            pendingServerResponseB64 = null
             mutate {
                 copy(
                     phase = ConnectionPhase.FAILED,
@@ -194,17 +219,17 @@ class ConnectionOrchestrator {
         }
     }
 
-    /** Starts the native packet pump on the TUN fd. Requires a completed handshake. */
+    /**
+     * Starts the bidirectional tunnel pump on the TUN fd. Requires a
+     * completed handshake and the established tunnel socket; record
+     * sequences continue where the data-plane probe left off.
+     */
     fun startPump(fd: Int, blockIpv6: Boolean = false): Result<Unit> {
         return runCatching {
-            val response = if (blockIpv6) {
-                JSONObject(NativeBridge.nativeStartPumpWithConfig(fd, true))
-            } else {
-                JSONObject(NativeBridge.nativeStartPump(fd))
-            }
+            val response = JSONObject(NativeBridge.nativeStartTunnelPump(fd, blockIpv6))
             require(response.optBoolean("ok", false)) { response.optString("reason", "pump start rejected") }
         }.onSuccess {
-            mutate { copy(pumpRunning = true, statusLine = "Packet pump running${if (blockIpv6) " (IPv6 blocked)" else ""}") }
+            mutate { copy(pumpRunning = true, statusLine = "Tunnel pump running${if (blockIpv6) " (IPv6 blocked)" else ""}") }
         }.onFailure {
             mutate {
                 copy(
@@ -217,19 +242,22 @@ class ConnectionOrchestrator {
     }
 
     /** Starts a retry: reports attempt N and clears stale plane state. */
-    fun beginRetry(attempt: Int) = mutate {
-        copy(
-            phase = ConnectionPhase.PREPARING,
-            statusLine = "Reconnect attempt $attempt",
-            failureReason = FailureReason.NONE,
-            failureDetail = "",
-            retryAttempt = attempt,
-            controlPlaneReady = false,
-            handshakeInitiated = false,
-            handshakeCompleted = false,
-            dataPlaneReady = false,
-            pumpRunning = false
-        )
+    fun beginRetry(attempt: Int) {
+        pendingServerResponseB64 = null
+        mutate {
+            copy(
+                phase = ConnectionPhase.PREPARING,
+                statusLine = "Reconnect attempt $attempt",
+                failureReason = FailureReason.NONE,
+                failureDetail = "",
+                retryAttempt = attempt,
+                controlPlaneReady = false,
+                handshakeInitiated = false,
+                handshakeCompleted = false,
+                dataPlaneReady = false,
+                pumpRunning = false
+            )
+        }
     }
 
     fun reportRetryExhausted() = mutate {
@@ -247,8 +275,10 @@ class ConnectionOrchestrator {
         copy(statusLine = "Reconnecting in ${delayMs}ms (attempt ${attempt + 1})")
     }
 
-    fun stopPump() {
-        runCatching { NativeBridge.nativeStopPump() }
+    /** Full teardown: pump, session keys, tunnel socket. */
+    fun disconnect() {
+        runCatching { NativeBridge.nativeDisconnectTunnel() }
+        pendingServerResponseB64 = null
         mutate { copy(pumpRunning = false) }
     }
 
@@ -273,6 +303,7 @@ class ConnectionOrchestrator {
     }
 
     fun reset() {
+        pendingServerResponseB64 = null
         val cur = _state.value
         _state.value = ConnectionSnapshot(
             nativeVersion = cur.nativeVersion,

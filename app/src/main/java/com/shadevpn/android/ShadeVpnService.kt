@@ -119,6 +119,7 @@ class ShadeVpnService : VpnService() {
         // 1. Lane validation (sanitized payload only)
         orchestrator.buildRealityLane().onFailure {
             orchestrator.fail(FailureReason.JNI_ERROR, "Failed to build Reality lane")
+            nativeDisconnectQuietly()
             stopSelf()
             return true
         }
@@ -126,13 +127,19 @@ class ShadeVpnService : VpnService() {
         // 2. Bounded control-plane reachability (TCP connect)
         orchestrator.probeControlPlane().getOrElse { return false }
 
-        // 3. Real Reality handshake: X25519 + session HMAC + AES-GCM records.
-        orchestrator.initiateHandshake().getOrElse { return false }
+        // 3. Real tunnel establishment: TCP + Reality handshake over the wire.
+        //    The server response is staged in the orchestrator; the state
+        //    machine, not the native layer, decides when to complete.
+        orchestrator.connectTunnel().getOrElse { return false }
 
-        // 4. Data-plane probe: natively refuses to pass without live keys.
+        // 4. Authenticate the server response to finish the session.
+        orchestrator.completeHandshake().getOrElse { return false }
+
+        // 5. Data-plane probe over the live tunnel: natively refuses to pass
+        //    without a completed handshake and an established socket.
         orchestrator.runDataPlaneProbe().getOrElse { return false }
 
-        // 5. Data plane proven. Re-check the generation immediately before
+        // 6. Data plane proven. Re-check the generation immediately before
         // starting the pump: a stop or re-attach must never leave a pump
         // running on a TUN the service has torn down.
         if (generation != connectGeneration) return true
@@ -156,10 +163,17 @@ class ShadeVpnService : VpnService() {
     }
 
     private fun stopTunnel() {
-        orchestrator.stopPump()
+        // Full native teardown first: stops the pump AND drops the session
+        // keys + tunnel socket. Never leaves a live session behind the TUN.
+        orchestrator.disconnect()
         tunInterface?.close()
         tunInterface = null
         stopSelf()
+    }
+
+    /** Best-effort native teardown that must never mask a fatal failure. */
+    private fun nativeDisconnectQuietly() {
+        runCatching { orchestrator.disconnect() }
     }
 
     override fun onRevoke() {

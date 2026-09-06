@@ -80,7 +80,7 @@ class MainActivity : ComponentActivity() {
                     startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
                 },
                 onStop = {
-                    orchestrator.stopPump()
+                    scope.launch(Dispatchers.IO) { orchestrator.disconnect() }
                     ShadeVpnServiceController.stop(this)
                 }
             )

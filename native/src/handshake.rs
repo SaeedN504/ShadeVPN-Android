@@ -1,10 +1,12 @@
 //! Reality (VISION-preflight style) handshake state machine.
 //!
-//! Milestone 3 scope: real cryptographic state, not just TCP reachability.
+//! Scope: real cryptographic state, not just TCP reachability.
 //! This module performs the X25519 key agreement, session-ID HMAC
 //! authentication, and HKDF key schedule that Reality prescribes, and emits
-//! an authenticated, AES-256-GCM sealed ClientHello payload ready to be
-//! written to the wire by the transport layer.
+//! a REAL TLS 1.3 ClientHello record (built by `crate::tls`) in which the
+//! ephemeral key_share, the session tag in `random`, and the short ID in
+//! legacy_session_id carry the Reality material. The transport layer writes
+//! that record to the socket verbatim.
 //!
 //! Security notes:
 //! - Ephemeral X25519 keys are zeroized on drop (x25519-dalek `StaticSecret`).
@@ -14,7 +16,7 @@
 //!   never reused across seals with the same key.
 //! - No secrets are ever formatted into error strings.
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -23,11 +25,27 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-const HKDF_SALT: &[u8] = b"shadevpn-reality-hkdf-salt-v1";
-const SESSION_INFO: &[u8] = b"shadevpn-session-id-v1";
-const KEY_INFO: &[u8] = b"shadevpn-record-keys-v1";
+use crate::tls;
+
+pub(crate) const HKDF_SALT: &[u8] = b"shadevpn-reality-hkdf-salt-v1";
+pub(crate) const SESSION_INFO: &[u8] = b"shadevpn-session-id-v1";
+/// HKDF info label for the session-id value itself (distinct from the auth key).
+pub(crate) const SESSION_ID_VALUE_INFO: &[u8] = b"shadevpn-session-id-value";
+pub(crate) const KEY_INFO: &[u8] = b"shadevpn-record-keys-v1";
+/// Nonce domain separation: client->server and server->client records must
+/// never derive the same nonce even at the same sequence number, because a
+/// mirrored record would otherwise reuse a nonce.
+pub(crate) const NONCE_DOMAIN_CLIENT: &[u8] = b"shadevpn-nonce-client-v1";
+pub(crate) const NONCE_DOMAIN_SERVER: &[u8] = b"shadevpn-nonce-server-v1";
+/// Nonce purposes on top of the direction domains: the server response
+/// confirmation and data records each get their own nonce space, so a
+/// confirmation and a data record at the same sequence never share a nonce.
+pub(crate) const NONCE_PURPOSE_RESPONSE: &[u8] = b"shadevpn-purpose-response-v1";
+pub(crate) const NONCE_PURPOSE_DATA: &[u8] = b"shadevpn-purpose-data-v1";
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
+/// Server response wire format: [32-byte session tag][sealed payload].
+pub const SERVER_RESPONSE_MIN: usize = 32 + TAG_LEN;
 
 /// Structured, secret-free handshake failure reasons surfaced to the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +72,7 @@ impl HandshakeError {
 }
 
 /// Server-side Reality parameters needed for the client handshake.
-/// Only validation material is kept; no private data is stored.
+/// Only validation material is retained; no private data is stored.
 #[derive(Debug, Clone)]
 pub struct HandshakeParams {
     pub server_address: String,
@@ -62,17 +80,25 @@ pub struct HandshakeParams {
     pub sni: String,
     pub server_public_key: [u8; 32],
     pub short_id: Vec<u8>,
+    /// Browser TLS fingerprint to mimic; reserved for the on-device TLS
+    /// camouflage layer.
+    #[allow(dead_code)]
     pub fingerprint: Option<String>,
 }
 
 /// Client-side handshake state. Ephemeral secret is zeroized on drop.
 pub struct HandshakeState {
+    /// Kept for drop-time zeroization; never read after `initiate`.
+    #[allow(dead_code)]
     ephemeral: StaticSecret,
+    /// Retained for future diagnostics/rotation logging; the wire copy of
+    /// the ephemeral pk rides inside `sealed_client_hello`.
+    #[allow(dead_code)]
     ephemeral_public: PublicKey,
     session_id: [u8; 32],
     send_key: [u8; 32],
     recv_key: [u8; 32],
-    sealed_client_hello: Vec<u8>,
+    wire_client_hello: Vec<u8>,
     completed: AtomicBool,
 }
 
@@ -84,13 +110,13 @@ fn hkdf_expand(salt: &[u8], ikm: &[u8], info: &[u8], out_len: usize) -> Vec<u8> 
     out
 }
 
-fn session_id_hmac(auth_key: &[u8; 32], session_id: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn session_id_hmac(auth_key: &[u8; 32], session_id: &[u8; 32]) -> [u8; 32] {
     let mut mac = make_mac(auth_key);
     mac.update(session_id);
     mac.finalize().into_bytes().into()
 }
 
-fn make_mac(key_bytes: &[u8]) -> Hmac<Sha256> {
+pub(crate) fn make_mac(key_bytes: &[u8]) -> Hmac<Sha256> {
     <Hmac<Sha256> as hmac::Mac>::new_from_slice(key_bytes).expect("hmac accepts any key length")
 }
 
@@ -123,14 +149,10 @@ impl HandshakeState {
         let auth_key: [u8; 32] = hkdf_expand(HKDF_SALT, shared.as_bytes(), SESSION_INFO, 32)
             .try_into()
             .unwrap();
-        let session_id: [u8; 32] = hkdf_expand(
-            HKDF_SALT,
-            shared.as_bytes(),
-            b"shadevpn-session-id-value",
-            32,
-        )
-        .try_into()
-        .unwrap();
+        let session_id: [u8; 32] =
+            hkdf_expand(HKDF_SALT, shared.as_bytes(), SESSION_ID_VALUE_INFO, 32)
+                .try_into()
+                .unwrap();
         let session_tag = session_id_hmac(&auth_key, &session_id);
 
         // Derive bidirectional record keys (client->server, server->client).
@@ -140,24 +162,19 @@ impl HandshakeState {
         let send_key: [u8; 32] = record_keys[..32].try_into().unwrap();
         let recv_key: [u8; 32] = record_keys[32..].try_into().unwrap();
 
-        // Seal the ClientHello payload with AES-256-GCM under the send key.
-        // Payload is the ephemeral public key, SNI, and the session-id tag.
-        let mut hello = Vec::with_capacity(96);
-        hello.extend_from_slice(ephemeral_public.as_bytes());
-        hello.extend_from_slice(params.sni.as_bytes());
-        hello.extend_from_slice(&session_tag);
-
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&send_key));
-        let nonce = derive_nonce(&session_id, 0);
-        let sealed = cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &hello,
-                    aad: &params.server_address.clone().into_bytes(),
-                },
-            )
-            .map_err(|_| HandshakeError::SealFailed)?;
+        // Reality material rides in REAL TLS 1.3 ClientHello fields (see
+        // tls.rs): the ephemeral public key in key_share, the session tag in
+        // random, the short ID in legacy_session_id, the SNI in server_name.
+        // Authentication does not depend on any non-TLS payload: the server
+        // recomputes the session tag from the ECDH shared secret and compares
+        // it byte-for-byte with the one in `random` before responding.
+        let wire_hello = tls::build_client_hello(
+            Some(&params.sni),
+            ephemeral_public.as_bytes(),
+            &session_tag,
+            &params.short_id,
+        )
+        .map_err(|_| HandshakeError::SealFailed)?;
 
         Ok(HandshakeState {
             ephemeral,
@@ -165,26 +182,21 @@ impl HandshakeState {
             session_id,
             send_key,
             recv_key,
-            sealed_client_hello: sealed,
+            wire_client_hello: wire_hello,
             completed: AtomicBool::new(false),
         })
     }
 
-    pub fn sealed_client_hello(&self) -> &[u8] {
-        &self.sealed_client_hello
+    /// The real TLS 1.3 ClientHello record to write to the socket.
+    pub fn client_hello(&self) -> &[u8] {
+        &self.wire_client_hello
     }
 
-    pub fn session_id(&self) -> &[u8; 32] {
-        &self.session_id
-    }
-
-    pub fn ephemeral_public(&self) -> &[u8; 32] {
-        self.ephemeral_public.as_bytes()
-    }
-
-    /// Verify the server's response is bound to our session (HMAC of the
-    /// session id under the receive key) and complete the handshake. Only
-    /// after this returns Ok may the data-plane probe run.
+    /// Verify the server's response is bound to our session and complete the
+    /// handshake. Wire format: [32-byte session-id tag][sealed confirmation]
+    /// where the tag is HMAC(recv_key, session_id) and the confirmation is
+    /// sealed under the server->client key. Only after this returns Ok may
+    /// the data-plane probe run.
     pub fn complete(&self, server_response: &[u8]) -> Result<(), HandshakeError> {
         if self
             .completed
@@ -193,7 +205,7 @@ impl HandshakeState {
         {
             return Err(HandshakeError::SessionAuthRejected);
         }
-        if server_response.len() < 32 + TAG_LEN {
+        if server_response.len() < SERVER_RESPONSE_MIN {
             self.completed.store(false, Ordering::SeqCst);
             return Err(HandshakeError::SessionAuthRejected);
         }
@@ -203,9 +215,15 @@ impl HandshakeState {
             self.completed.store(false, Ordering::SeqCst);
             return Err(HandshakeError::SessionAuthRejected);
         }
-        // Server also echoes a sealed confirmation under recv_key.
+        // Server also echoes a sealed confirmation under recv_key (its
+        // send key), in the server nonce domain.
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.recv_key));
-        let nonce = derive_nonce(&self.session_id, 1);
+        let nonce = derive_nonce(
+            &self.session_id,
+            0,
+            Direction::Server,
+            NONCE_PURPOSE_RESPONSE,
+        );
         if cipher
             .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
             .is_err()
@@ -222,7 +240,7 @@ impl HandshakeState {
 
     pub fn seal_record(&self, seq: u64, plaintext: &[u8]) -> Result<Vec<u8>, HandshakeError> {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.send_key));
-        let nonce = derive_nonce(&self.session_id, seq);
+        let nonce = derive_nonce(&self.session_id, seq, Direction::Client, NONCE_PURPOSE_DATA);
         cipher
             .encrypt(Nonce::from_slice(&nonce), plaintext)
             .map_err(|_| HandshakeError::SealFailed)
@@ -232,16 +250,21 @@ impl HandshakeState {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.recv_key));
         cipher
             .decrypt(
-                Nonce::from_slice(&derive_nonce(&self.session_id, seq)),
+                Nonce::from_slice(&derive_nonce(
+                    &self.session_id,
+                    seq,
+                    Direction::Server,
+                    NONCE_PURPOSE_DATA,
+                )),
                 ciphertext,
             )
             .map_err(|_| HandshakeError::SessionAuthRejected)
     }
 
     /// Loopback-only verification: opens a record sealed by THIS side under
-    /// the send key. Used by the data-plane probe and tests to prove the
-    /// seal path produces recoverable, authenticated bytes. Records from the
-    /// server must go through `open_record` (recv key) instead.
+    /// the send key. Superseded on the live path by wire round trips through
+    /// the honest server; retained as the seal-path verifier for unit tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn open_local_record(
         &self,
         seq: u64,
@@ -250,17 +273,42 @@ impl HandshakeState {
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.send_key));
         cipher
             .decrypt(
-                Nonce::from_slice(&derive_nonce(&self.session_id, seq)),
+                Nonce::from_slice(&derive_nonce(
+                    &self.session_id,
+                    seq,
+                    Direction::Client,
+                    NONCE_PURPOSE_DATA,
+                )),
                 ciphertext,
             )
             .map_err(|_| HandshakeError::SessionAuthRejected)
     }
 }
 
-/// Deterministic per-sequence nonce derived from the session id. A fresh
-/// 96-bit nonce per record with the same key, never reused for a given seq.
-fn derive_nonce(session_id: &[u8; 32], seq: u64) -> [u8; NONCE_LEN] {
+/// Which side produced a record. Direction and sequence together pick the
+/// nonce domain, so a client record and a server record at the same seq
+/// never collide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Client,
+    Server,
+}
+
+/// Deterministic nonce from the session id, direction, purpose, and record
+/// sequence. Never reused for a given (key, direction, purpose, seq) tuple.
+pub(crate) fn derive_nonce(
+    session_id: &[u8; 32],
+    seq: u64,
+    direction: Direction,
+    purpose: &[u8],
+) -> [u8; NONCE_LEN] {
+    let domain = match direction {
+        Direction::Client => NONCE_DOMAIN_CLIENT,
+        Direction::Server => NONCE_DOMAIN_SERVER,
+    };
     let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(purpose);
     hasher.update(session_id);
     hasher.update(seq.to_be_bytes());
     let out = hasher.finalize();
@@ -335,11 +383,14 @@ mod tests {
     }
 
     #[test]
-    fn initiates_and_seals_client_hello() {
+    fn initiates_and_builds_tls_hello() {
         let state = HandshakeState::initiate(&test_params()).expect("initiate");
-        let hello = state.sealed_client_hello();
-        // 32 ephemeral pk + sni bytes + 32 session tag + 16 GCM tag.
-        assert!(hello.len() >= 32 + 32 + TAG_LEN);
+        let hello = state.client_hello();
+        // A real TLS record: handshake content type, then a ClientHello
+        // message large enough to carry random (32) + key_share (32).
+        assert_eq!(hello[0], 0x16);
+        assert_eq!(hello[5], 0x01);
+        assert!(hello.len() >= 5 + 4 + 2 + 32 + 32);
         assert!(!state.is_completed());
     }
 
@@ -393,51 +444,53 @@ mod tests {
 
     #[test]
     fn completes_against_honest_server_and_rejects_impostor() {
-        // Honest server: knows the same static secret, can derive the same keys.
+        // Honest server: knows the same static secret, reads ONLY the wire
+        // hello, and derives everything else from the ephemeral pk in it.
         let server_secret = StaticSecret::from([7u8; 32]);
         let server_public = PublicKey::from(&server_secret);
         let mut params = test_params();
         params.server_public_key = *server_public.as_bytes();
 
-        let mut client = HandshakeState::initiate(&params).expect("client initiate");
-        let client_hello = client.sealed_client_hello().to_vec();
+        let client = HandshakeState::initiate(&params).expect("client initiate");
+        let wire_hello = client.client_hello().to_vec();
 
-        // Server side: decrypt the hello, recover the ephemeral pk, derive keys.
-        let client_ephemeral = PublicKey::from(*client.ephemeral_public());
+        // ---- server side, from wire bytes only ----
+        let hello = crate::tls::parse_client_hello(&wire_hello).expect("parse TLS hello");
+        let client_ephemeral = PublicKey::from(hello.ephemeral_public);
         let shared = server_secret.diffie_hellman(&client_ephemeral);
+        let session_id: [u8; 32] =
+            hkdf_expand(HKDF_SALT, shared.as_bytes(), SESSION_ID_VALUE_INFO, 32)
+                .try_into()
+                .unwrap();
         let record_keys: [u8; 64] = hkdf_expand(HKDF_SALT, shared.as_bytes(), KEY_INFO, 64)
             .try_into()
             .unwrap();
-        let server_recv = &record_keys[..32]; // client->server key
         let server_send = &record_keys[32..]; // server->client key
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(server_recv));
-        // The client sealed with derive_nonce(session_id, 0); server derives the
-        // same session id from shared secret to rebuild the nonce.
-        let session_id: [u8; 32] = hkdf_expand(
-            HKDF_SALT,
-            shared.as_bytes(),
-            b"shadevpn-session-id-value",
-            32,
-        )
-        .try_into()
-        .unwrap();
-        let _hello_plain = cipher
-            .decrypt(
-                Nonce::from_slice(&derive_nonce(&session_id, 0)),
-                Payload {
-                    msg: client_hello.as_ref(),
-                    aad: params.server_address.as_bytes(),
-                },
-            )
-            .expect("server opens client hello");
+        // Wire truth: SNI, short ID, and the authenticated session tag all
+        // arrived inside real TLS fields.
+        assert_eq!(hello.sni.as_deref(), Some(params.sni.as_str()));
+        assert_eq!(hello.short_id, params.short_id);
+        let auth_key: [u8; 32] = hkdf_expand(HKDF_SALT, shared.as_bytes(), SESSION_INFO, 32)
+            .try_into()
+            .unwrap();
+        let expected_tag = session_id_hmac(&auth_key, &session_id);
+        assert_eq!(
+            hello.session_tag, expected_tag,
+            "session tag in random must authenticate"
+        );
 
-        // Server builds its authenticated response.
+        // Server builds its authenticated response: tag || sealed confirm.
         let response_plain: &[u8] = b"shadevpn-server-ok";
-        let server_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(server_send));
-        let sealed_response = server_cipher
+        let server_seal = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(server_send));
+        let sealed_response = server_seal
             .encrypt(
-                Nonce::from_slice(&derive_nonce(&session_id, 1)),
+                Nonce::from_slice(&derive_nonce(
+                    &session_id,
+                    0,
+                    Direction::Server,
+                    NONCE_PURPOSE_RESPONSE,
+                )),
                 response_plain,
             )
             .expect("server seals");
@@ -446,12 +499,16 @@ mod tests {
         mac.update(&session_id);
         server_response.extend_from_slice(&mac.finalize().into_bytes());
         server_response.extend_from_slice(&sealed_response);
+        // ---- end server side ----
 
         assert!(client.complete(&server_response).is_ok());
         assert!(client.is_completed());
 
+        // The session is single-use: a replayed response cannot re-complete.
+        assert!(client.complete(&server_response).is_err());
+
         // Impostor: wrong HMAC tag prefix must be rejected.
-        let mut bad_client = HandshakeState::initiate(&test_params()).unwrap();
+        let bad_client = HandshakeState::initiate(&test_params()).unwrap();
         let mut forged = server_response.clone();
         forged[0] ^= 0xff;
         assert!(bad_client.complete(&forged).is_err());

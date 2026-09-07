@@ -11,10 +11,20 @@
 //! - SNI -> `server_name` extension
 //!
 //! Authentication does NOT depend on any non-TLS payload: the session tag is
-//! an unforgeable HMAC over the session id derived from the ECDH shared
-//! secret, so only a client holding the server's Reality key material can
-//! produce a valid (key_share, random) pair. A censor or prober that opens
-//! the record sees nothing but a plausible browser ClientHello.
+//! an unforgeable AEAD seal inside the legacy session id field, keyed by an
+//! Xray-construction HKDF over the ECDH shared secret and salted by bytes of
+//! `random` itself, so only a client holding the server's Reality key
+//! material can produce a valid (key_share, session_id) pair. A censor or
+//! prober that opens the record sees nothing but a plausible browser
+//! ClientHello.
+//!
+//! NOTE: the reference REALITY deployment inspects the ClientHello through a
+//! full Go TLS stack (uTLS client, Go server parser) and tolerates only
+//! shapes a real TLS stack produces. Our hello is byte-legal and parses with
+//! any conforming parser, but until the client rides a full TLS stack its
+//! fingerprint is NONSTANDARD — a hand-built hello. Fingerprint realism is
+//! tracked for the on-device TLS-camouflage layer; nothing here depends on
+//! being mistaken for one particular browser.
 //!
 //! Bounds-checked everywhere; no secret material is embedded beyond the
 //! public ephemeral key and the (already MACed) session tag.
@@ -44,6 +54,13 @@ const GROUP_X25519: u16 = 0x001d;
 /// legacy_session_id is capped at 32 bytes by RFC 8446.
 const MAX_SESSION_ID_LEN: usize = 32;
 const X25519_PK_LEN: usize = 32;
+/// Byte offset of the legacy session id BYTES inside the full ClientHello
+/// record: record header (5) + handshake header (4) + legacy version (2) +
+/// random (32) + the 1-byte session-id length prefix. The length byte itself
+/// stays untouched — matching Xray, whose AAD window (`hello.Raw[39:]`)
+/// covers exactly the 32 id bytes. Exported so the REALITY layer can zero
+/// the session id when computing the AEAD additional authenticated data.
+pub const SESSION_ID_OFFSET: usize = 5 + 4 + 2 + 32 + 1;
 
 /// Test-only reachability: the parser's production consumer (standalone
 /// server tooling) ships in a later milestone; today only the honest
@@ -95,10 +112,10 @@ impl std::error::Error for TlsError {}
 pub struct ParsedClientHello {
     /// Host from the server_name extension, if offered.
     pub sni: Option<String>,
-    /// The 32-byte `random` field: carries the session tag.
-    pub session_tag: [u8; 32],
-    /// legacy_session_id bytes: carries the short ID selector.
-    pub short_id: Vec<u8>,
+    /// The 32-byte `random` field: REALITY salt and nonce source.
+    pub random: [u8; 32],
+    /// legacy_session_id bytes: the sealed REALITY session material.
+    pub session_id: Vec<u8>,
     /// X25519 public key from the key_share extension.
     pub ephemeral_public: [u8; 32],
     /// Whether the client offered TLS 1.3 in supported_versions.
@@ -122,14 +139,19 @@ fn push_extension(out: &mut Vec<u8>, ext_type: u16, data: &[u8]) {
 
 /// Build a complete TLS 1.3 ClientHello record.
 ///
+/// `random` is the real hello random (32 bytes): the REALITY layer salts its
+/// key derivation with `random[..20]` and uses `random[20..32]` as the AEAD
+/// nonce for the session-id seal. `session_id` is the (already sealed)
+/// 32-byte legacy session id, or zeros before sealing.
+///
 /// `sni = None` omits the server_name extension entirely (still legal TLS).
 pub fn build_client_hello(
     sni: Option<&str>,
     ephemeral_public: &[u8; X25519_PK_LEN],
-    session_tag: &[u8; 32],
-    short_id: &[u8],
+    random: &[u8; 32],
+    session_id: &[u8],
 ) -> Result<Vec<u8>, TlsError> {
-    if short_id.len() > MAX_SESSION_ID_LEN {
+    if session_id.len() > MAX_SESSION_ID_LEN {
         return Err(TlsError::ShortIdTooLong);
     }
 
@@ -184,12 +206,12 @@ pub fn build_client_hello(
         0xc0, 0x30, // ECDHE_RSA_AES_256_GCM
     ];
     let mut body: Vec<u8> = Vec::with_capacity(
-        2 + 32 + 1 + short_id.len() + 2 + cipher_suites.len() + 2 + 2 + exts.len(),
+        2 + 32 + 1 + session_id.len() + 2 + cipher_suites.len() + 2 + 2 + exts.len(),
     );
     body.extend_from_slice(&[0x03, 0x03]); // legacy_version
-    body.extend_from_slice(session_tag); // random: the Reality session tag
-    body.push(short_id.len() as u8); // legacy_session_id: the short ID
-    body.extend_from_slice(short_id);
+    body.extend_from_slice(random); // real hello random (REALITY salt + nonce)
+    body.push(session_id.len() as u8); // legacy_session_id: sealed REALITY material
+    body.extend_from_slice(session_id);
     push_u16(&mut body, cipher_suites.len() as u16);
     body.extend_from_slice(&cipher_suites);
     body.push(0x01); // compression_methods: length 1
@@ -269,14 +291,14 @@ pub fn parse_client_hello(wire: &[u8]) -> Result<ParsedClientHello, TlsError> {
     }
 
     let _legacy_version = r.take(2)?;
-    let session_tag: [u8; 32] = r.take(32)?.try_into().expect("32 bytes taken");
-    let short_id_len = r.u8()? as usize;
-    if short_id_len > MAX_SESSION_ID_LEN {
+    let random: [u8; 32] = r.take(32)?.try_into().expect("32 bytes taken");
+    let sid_len = r.u8()? as usize;
+    if sid_len > MAX_SESSION_ID_LEN {
         return Err(TlsError::ShortIdTooLong);
     }
-    let short_id = r.take(short_id_len)?.to_vec();
+    let session_id = r.take(sid_len)?.to_vec();
     let cipher_len = r.u16()? as usize;
-    if cipher_len % 2 != 0 {
+    if !cipher_len.is_multiple_of(2) {
         return Err(TlsError::LengthMismatch);
     }
     r.take(cipher_len)?;
@@ -354,8 +376,8 @@ pub fn parse_client_hello(wire: &[u8]) -> Result<ParsedClientHello, TlsError> {
 
     Ok(ParsedClientHello {
         sni,
-        session_tag,
-        short_id,
+        random,
+        session_id,
         ephemeral_public: ephemeral_public.ok_or(TlsError::NoX25519KeyShare)?,
         tls13_negotiable,
     })
@@ -379,13 +401,13 @@ mod tests {
 
     #[test]
     fn round_trip_preserves_all_reality_fields() {
-        let (sni, pk, tag, short_id) = sample_inputs();
-        let record = build_client_hello(Some(sni), &pk, &tag, &short_id).expect("build");
+        let (sni, pk, random, sid) = sample_inputs();
+        let record = build_client_hello(Some(sni), &pk, &random, &sid).expect("build");
         let parsed = parse_client_hello(&record).expect("parse");
         assert_eq!(parsed.sni.as_deref(), Some(sni));
         assert_eq!(parsed.ephemeral_public, pk);
-        assert_eq!(parsed.session_tag, tag);
-        assert_eq!(parsed.short_id, short_id);
+        assert_eq!(parsed.random, random);
+        assert_eq!(parsed.session_id, sid);
         assert!(parsed.tls13_negotiable);
     }
 
@@ -402,11 +424,18 @@ mod tests {
     }
 
     #[test]
-    fn random_field_carries_session_tag_byte_for_byte() {
-        let (_, pk, tag, short_id) = sample_inputs();
-        let record = build_client_hello(Some("x.example.com"), &pk, &tag, &short_id).unwrap();
+    fn random_field_rides_at_the_documented_offset() {
+        let (_, pk, random, sid) = sample_inputs();
+        let record = build_client_hello(Some("x.example.com"), &pk, &random, &sid).unwrap();
         // random starts after: record(5) + hs header(4) + legacy_version(2)
-        assert_eq!(&record[5 + 4 + 2..5 + 4 + 2 + 32], tag.as_slice());
+        assert_eq!(&record[11..43], random.as_slice());
+        // The session id bytes start after random AND the 1-byte length
+        // prefix — the offset the REALITY layer uses for its AAD window.
+        assert_eq!(SESSION_ID_OFFSET, 44);
+        assert_eq!(
+            &record[SESSION_ID_OFFSET..SESSION_ID_OFFSET + sid.len()],
+            sid.as_slice()
+        );
     }
 
     #[test]
@@ -428,10 +457,10 @@ mod tests {
 
     #[test]
     fn short_id_over_32_bytes_is_rejected() {
-        let (_, pk, tag, _) = sample_inputs();
+        let (_, pk, random, _) = sample_inputs();
         let long = vec![0u8; 33];
         assert_eq!(
-            build_client_hello(Some("x.example.com"), &pk, &tag, &long),
+            build_client_hello(Some("x.example.com"), &pk, &random, &long),
             Err(TlsError::ShortIdTooLong)
         );
     }

@@ -47,19 +47,13 @@ pub struct PumpStats {
 }
 
 /// Pump behavior knobs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct PumpConfig {
     /// Drop (blackhole) all IPv6 packets read from the TUN instead of
     /// sealing them. The pump is the only egress from the TUN, so dropping
     /// here means IPv6 never reaches the underlying network while the VPN
     /// still advertises an IPv6 route to catch that traffic.
     pub block_ipv6: bool,
-}
-
-impl Default for PumpConfig {
-    fn default() -> Self {
-        PumpConfig { block_ipv6: false }
-    }
 }
 
 /// IP version nibble of an IPv4/IPv6 header.

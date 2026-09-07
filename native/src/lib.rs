@@ -9,8 +9,10 @@ use std::time::Duration;
 
 mod handshake;
 mod pump;
+mod reality;
 mod tls;
 mod transport;
+mod vless;
 
 #[cfg(test)]
 mod test_server;
@@ -88,7 +90,7 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeVersion(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
-    json_string(&mut env, "shadevpn-native/0.6.0")
+    json_string(&mut env, "shadevpn-native/0.7.0")
 }
 
 #[no_mangle]
@@ -362,7 +364,6 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeStartTunnelP
                 s.next_out_seq,
                 s.next_in_seq,
             )
-            .map_err(|e| e)
     });
     let value = match outcome {
         Ok(()) => json!({"ok": true, "pump": "started"}),

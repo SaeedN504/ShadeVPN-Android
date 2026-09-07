@@ -4,36 +4,48 @@ Android client and native transport layer for ShadeVPN.
 
 ## Milestone 4b (in progress)
 
-The tunnel has leak protection and reconnect resilience (milestone 4a), and
-the Reality hello is now a **real TLS 1.3 ClientHello record** — the first
-4b step toward wire-level interop with Xray-style Reality endpoints.
+The tunnel has leak protection and reconnect resilience (milestone 4a), the
+Reality hello is a **real TLS 1.3 ClientHello record**, and the session
+authentication now follows the **Xray REALITY constructions** byte-for-byte:
+Xray-compat session-id sealing, temporary trusted certificates, and
+forward-secret record keys.
 
 What exists now:
 
 - Kotlin connection state model with explicit control-plane vs data-plane phases
 - `VpnService` lifecycle with TUN ownership staying on Android
 - VLESS + Reality profile parser for `tcp`, `ws`, and `xhttp`
-- **Real Reality handshake state** in Rust: X25519 ephemeral key agreement,
-  HKDF-SHA256 key schedule, HMAC session-id authentication, AES-256-GCM
-  record sealing/opening
-- **Real TLS 1.3 ClientHello on the wire**: the hello is a byte-legal TLS
-  1.3 record — ephemeral X25519 key in `key_share`, session tag in
-  `random`, short ID in `legacy_session_id`, SNI in `server_name`, plus
-  browser-realistic cipher suites and extensions. Authentication does not
-  depend on any non-TLS payload: only a client holding the server's Reality
-  key material can produce a valid (`key_share`, `random`) pair, and a
-  passive observer sees nothing but a plausible browser handshake
+- **REALITY session authentication, Xray constructions**: `AuthKey =
+  HKDF-SHA256(X25519(ephemeral, static), salt = random[..20], "REALITY")`;
+  the legacy session id carries an AES-256-GCM seal of
+  `[client version][reserved][unix time][short id]` with nonce =
+  `random[20..32]` and AAD = the hello with the session id zeroed —
+  identical to `XTLS/REALITY` `tls.go` and Xray-core `reality.go`
+- **Temporary trusted certificates**: the server answers with
+  `[Ed25519 pubkey][HMAC-SHA512(AuthKey, pubkey)]`; the client accepts the
+  session only on that HMAC and rejects anything else — so a redirected or
+  MITM'd connection presenting the target site's real certificate is
+  detected exactly as Xray clients detect it
+- **Forward-secret record keys**: the server response carries a FRESH
+  X25519 key share; record keys derive from the post-hello ECDHE bound to
+  the authenticated session, so recording today's traffic cannot decrypt
+  future sessions even if the server static key leaks
+- **Real TLS 1.3 ClientHello on the wire**: a byte-legal TLS 1.3 record —
+  ephemeral X25519 key in `key_share`, SNI in `server_name`, browser-
+  realistic cipher suites and extensions. Note: until the client rides a
+  full TLS stack the hello fingerprint is nonstandard (hand-built), which
+  is tracked for the on-device TLS-camouflage layer
 - **Data-plane probe**: a sealed probe record must open cleanly under the
   negotiated session keys; CONNECTED is only ever reported after this passes
 - **Wire-level transport**: length-prefixed record framing on the tunnel
   socket; the handshake, probe, and pump records all flow over the live
   connection instead of loopback-only verification
-- **Honest in-process Reality server** for interop tests: parses the TLS
-  1.3 ClientHello from raw wire bytes, derives the shared secret from the
-  key_share found there, authenticates the session tag from `random`, and
-  reports what actually crossed the wire (SNI seen, session authenticated,
-  records mirrored) so tests assert on wire truth, not client-side
-  bookkeeping
+- **Honest in-process REALITY server** for interop tests: runs the real
+  server-side flow (parse hello, derive AuthKey, unseal session id, check
+  version + short-id allowlist, issue temp cert, fresh key share) from raw
+  wire bytes only, and reports what actually crossed the wire (SNI seen,
+  session authenticated, records mirrored) so tests assert on wire truth,
+  not client-side bookkeeping
 - **Staged handshake in the orchestrator**: the native layer establishes the
   tunnel and returns the server response without auto-completing; Kotlin's
   state machine decides when to authenticate it, and any rejection tears the
@@ -54,10 +66,10 @@ Crypto stack (pure Rust, no foreign bindings, MIT-compatible):
 
 What still does **not** exist yet:
 
-- Interop against a real Xray Reality endpoint (the hello is now a real TLS
-  1.3 ClientHello record, but Xray's server side — certificate forging,
-  VISION inner protocol, session-id leniency — is not yet replicated; the
-  honest in-process server covers wire-level interop in CI)
+- Interop against a real Xray Reality endpoint (the crypto constructions
+  now match XTLS byte-for-byte; what remains is a full TLS stack on the
+  client for fingerprint realism, and the VLESS VISION inner protocol
+  after the TLS record layer)
 - Always-on/kill-switch enforcement (the settings deep-link exists;
   programmatic verification of Android's lockdown mode is on-device work)
 - Fallback lane racing (MASQUE H2, Shadowsocks 2022)
@@ -80,8 +92,7 @@ OpenVPN and MTProto are intentionally out of scope.
 
 Remaining milestone 4b candidates:
 
-- Xray server-side behavior: certificate forging for proxied SNI and the
-  VLESS VISION inner protocol after the TLS record
+- VLESS VISION inner protocol over the TLS record layer
 - fallback lane racing (MASQUE H2 as proven backup)
 - on-device soak test of reconnect under real network loss
 

@@ -1,14 +1,17 @@
-//! Integration-test helpers: an honest in-process Reality server plus a
+//! Integration-test helpers: an honest in-process REALITY server plus a
 //! client-side tunnel helper, both wire-true.
 //!
-//! The server reads ONLY framed TLS ClientHello records from the socket,
-//! parses the hello from raw bytes (a real TLS 1.3 record: SNI in
-//! server_name, ephemeral key in key_share, session tag in random, short ID
-//! in legacy_session_id), derives the shared secret from the ephemeral key
-//! found there, authenticates the session tag from `random`, and answers
-//! with properly framed, sealed responses. It has no access to client-side
-//! state. The client helper runs the real `HandshakeState` over the wire —
-//! no shortcut anywhere.
+//! The server reads ONLY framed TLS ClientHello records from the socket and
+//! runs the real server-side flow with no access to client state:
+//!
+//! 1. Parse the hello (SNI, random, session id, key_share) from raw bytes.
+//! 2. Derive the REALITY AuthKey (Xray construction) from the ECDH shared
+//!    secret and unseal the session id; reject on failure.
+//! 3. Check the client version and the short-id allowlist.
+//! 4. Issue the temporary trusted certificate, generate a FRESH X25519
+//!    server key share, derive the forward-secret record keys, and seal the
+//!    confirmation.
+//! 5. Mirror data records under the negotiated keys.
 //!
 //! The `ServerObservation` returned by the server thread is what makes the
 //! integration tests strong: tests assert on what ACTUALLY crossed the wire
@@ -19,15 +22,15 @@
 //! Test-only: included from lib.rs under #[cfg(test)].
 
 use crate::handshake::{
-    derive_nonce, make_mac, session_id_hmac, Direction, HandshakeParams, HandshakeState, HKDF_SALT,
-    KEY_INFO, NONCE_PURPOSE_DATA, NONCE_PURPOSE_RESPONSE, SESSION_ID_VALUE_INFO, SESSION_INFO,
+    derive_nonce, Direction, HandshakeParams, HandshakeState, CLIENT_VERSION, HKDF_SALT, KEY_INFO,
+    NONCE_PURPOSE_DATA, NONCE_PURPOSE_RESPONSE,
 };
+use crate::reality::{self, ServerEphemeral};
 use crate::tls;
 use crate::transport::{read_frame, write_frame};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use hkdf::Hkdf;
-use hmac::Mac;
 use sha2::Sha256;
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -94,6 +97,21 @@ pub fn spawn(
     (port, handle)
 }
 
+/// The short id the test client presents, zero padded to the 8-byte slot.
+fn expected_short_id() -> [u8; 8] {
+    let mut sid = [0u8; 8];
+    sid[..2].copy_from_slice(&[0x01, 0x02]);
+    sid
+}
+
+fn hkdf_expand(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
+    let mut out = vec![0u8; len];
+    hk.expand(info, &mut out)
+        .expect("fixed-length expand is valid");
+    out
+}
+
 fn run_server(
     listener: TcpListener,
     server_secret_bytes: [u8; 32],
@@ -113,48 +131,56 @@ fn run_server(
         .ok_or("client closed before hello")?;
     let hello =
         tls::parse_client_hello(&hello_frame).map_err(|e| format!("bad TLS ClientHello: {e}"))?;
+    let sni = hello.sni.clone().ok_or("no SNI offered")?;
 
-    let client_ephemeral = PublicKey::from(hello.ephemeral_public);
-    let shared = server_secret.diffie_hellman(&client_ephemeral);
-    let shared_bytes = shared.as_bytes();
+    // REALITY AuthKey (Xray construction) from the ECDH shared secret.
+    let shared = server_secret.diffie_hellman(&PublicKey::from(hello.ephemeral_public));
+    let auth_key = reality::auth_key(shared.as_bytes(), &hello.random);
 
-    let session_id: [u8; 32] = hkdf_expand(HKDF_SALT, shared_bytes, SESSION_ID_VALUE_INFO, 32)
+    // Unseal the session id. AAD = the received hello with the session id
+    // zeroed — exactly what the client sealed against.
+    let mut aad = hello_frame.clone();
+    let off = tls::SESSION_ID_OFFSET;
+    aad[off..off + 32].fill(0);
+    let sid: [u8; 32] = hello
+        .session_id
+        .clone()
         .try_into()
-        .map_err(|_| "session id expand failed".to_owned())?;
+        .map_err(|_| "session id is not 32 bytes".to_owned())?;
+    let plain = reality::unseal_session_id(&auth_key, &hello.random, &aad, &sid)
+        .map_err(|e| format!("session id rejected: {e:?}"))?;
+    if plain.client_version != CLIENT_VERSION {
+        return Err("client version mismatch".to_owned());
+    }
+    if plain.short_id != expected_short_id() {
+        return Err("short id not on the allowlist".to_owned());
+    }
 
-    // Record keys: [client->server (server's recv)][server->client (server's send)].
-    let record_keys = hkdf_expand(HKDF_SALT, shared_bytes, KEY_INFO, 64);
+    // Fresh server key share -> forward-secret record keys.
+    let server_eph = ServerEphemeral::generate();
+    let ecdhe = server_eph.shared_secret(&hello.ephemeral_public);
+    let binding = reality::session_identity(&sid, &ecdhe);
+    let record_keys = hkdf_expand(HKDF_SALT, &binding, KEY_INFO, 64);
     let server_recv_key: [u8; 32] = record_keys[..32].try_into().unwrap();
     let server_send_key: [u8; 32] = record_keys[32..].try_into().unwrap();
 
-    // Authenticate the session: recompute the tag from the shared secret and
-    // compare it byte-for-byte with the one the client put in `random`.
-    let auth_key: [u8; 32] = hkdf_expand(HKDF_SALT, shared_bytes, SESSION_INFO, 32)
-        .try_into()
-        .map_err(|_| "auth key expand failed".to_owned())?;
-    let expected_tag = session_id_hmac(&auth_key, &session_id);
-    if hello.session_tag != expected_tag {
-        return Err("session tag in random did not authenticate".to_owned());
-    }
-    let sni = hello.sni.clone().ok_or("no SNI offered")?;
-
-    // ---- respond: [32-byte session tag][sealed confirmation] ----
+    // ---- respond: [temp cert 96][server share 32][sealed confirmation] ----
     let send_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&server_send_key));
-    let response_nonce = derive_nonce(&session_id, 0, Direction::Server, NONCE_PURPOSE_RESPONSE);
+    let response_nonce = derive_nonce(&sid, 0, Direction::Server, NONCE_PURPOSE_RESPONSE);
     let sealed_confirm = send_cipher
         .encrypt(
             Nonce::from_slice(&response_nonce),
             b"shadevpn-server-ok".as_ref(),
         )
         .map_err(|_| "server seal failed".to_owned())?;
-    let mut response = Vec::with_capacity(32 + sealed_confirm.len());
-    let mut mac = make_mac(&server_send_key);
-    mac.update(&session_id);
-    response.extend_from_slice(&mac.finalize().into_bytes());
+    let mut response = Vec::with_capacity(96 + 32 + sealed_confirm.len());
+    response.extend_from_slice(&reality::temporary_certificate(&auth_key));
+    response.extend_from_slice(&server_eph.public);
     response.extend_from_slice(&sealed_confirm);
     write_frame(&mut stream, &response).map_err(|e| format!("write response: {e}"))?;
 
     // ---- record loop: open client data records, seal a mirror back ----
+    let recv_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&server_recv_key));
     let mut seq_in: u64 = 0;
     let mut seq_out: u64 = 0;
     loop {
@@ -163,14 +189,12 @@ fn run_server(
                 if frame.is_empty() {
                     continue;
                 }
-                let in_nonce =
-                    derive_nonce(&session_id, seq_in, Direction::Client, NONCE_PURPOSE_DATA);
-                let opened = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&server_recv_key))
+                let in_nonce = derive_nonce(&sid, seq_in, Direction::Client, NONCE_PURPOSE_DATA);
+                let opened = recv_cipher
                     .decrypt(Nonce::from_slice(&in_nonce), frame.as_ref())
                     .map_err(|_| "record failed to open".to_owned())?;
                 seq_in += 1;
-                let out_nonce =
-                    derive_nonce(&session_id, seq_out, Direction::Server, NONCE_PURPOSE_DATA);
+                let out_nonce = derive_nonce(&sid, seq_out, Direction::Server, NONCE_PURPOSE_DATA);
                 let resealed = send_cipher
                     .encrypt(Nonce::from_slice(&out_nonce), opened.as_ref())
                     .map_err(|_| "re-seal failed".to_owned())?;
@@ -187,12 +211,4 @@ fn run_server(
         session_authenticated: true,
         records_mirrored: seq_out,
     })
-}
-
-fn hkdf_expand(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
-    let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
-    let mut out = vec![0u8; len];
-    hk.expand(info, &mut out)
-        .expect("fixed-length expand is valid");
-    out
 }

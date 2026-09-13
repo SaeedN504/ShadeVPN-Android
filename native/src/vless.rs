@@ -286,6 +286,125 @@ pub fn build_response_header() -> Vec<u8> {
     vec![VERSION, 0x0a, 0x01, 0x00]
 }
 
+/// Total wire length of the VLESS request header starting at `wire`. The
+/// header is self-delimiting (fixed fields + varint addons + typed address);
+/// everything after it in the stream is Vision-framed payload data.
+pub fn request_header_len(wire: &[u8]) -> Result<usize, VlessError> {
+    if wire.len() < 1 + 16 + 1 {
+        return Err(VlessError::Layout);
+    }
+    let mut pos = 1 + 16; // version + uuid
+    if wire[pos] != 0x0a {
+        return Err(VlessError::Layout);
+    }
+    pos += 1;
+    let (addons_len, consumed) = decode_varint(&wire[pos..])?;
+    pos += consumed + addons_len;
+    if pos >= wire.len() {
+        return Err(VlessError::Layout);
+    }
+    let command = wire[pos];
+    pos += 1;
+    if command != CMD_MUX {
+        if pos + 2 > wire.len() {
+            return Err(VlessError::Layout);
+        }
+        pos += 2; // port
+        let atyp = *wire.get(pos).ok_or(VlessError::Layout)?;
+        pos += match atyp {
+            ATYP_IPV4 => 1 + 4,
+            ATYP_IPV6 => 1 + 16,
+            ATYP_DOMAIN => {
+                let len = *wire.get(pos + 1).ok_or(VlessError::Layout)? as usize;
+                2 + len
+            }
+            _ => return Err(VlessError::Layout),
+        };
+    }
+    Ok(pos)
+}
+
+/// Parse a hyphenated or bare-hex UUID string into 16 bytes.
+pub fn parse_uuid(raw: &str) -> Option<[u8; 16]> {
+    let hex: String = raw.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    hex::decode_to_slice(hex.as_bytes(), &mut out).ok()?;
+    Some(out)
+}
+
+/// Client-side VLESS + Vision stream writer: the state that sits between
+/// the tunnel's payload stream and the Reality record layer.
+///
+/// The FIRST wrapped payload carries the VLESS request header as the first
+/// content of the Vision padding stream (long padding hides the header
+/// exactly like Xray's first TLS-flow frames), and the padding phase ends
+/// after it — later payloads pass through as direct copy.
+pub struct VlessOut {
+    header: Option<Vec<u8>>,
+    writer: VisionWriter,
+}
+
+impl VlessOut {
+    pub fn new(
+        uuid: [u8; 16],
+        flow: Option<&str>,
+        command: u8,
+        address: &Address,
+        port: u16,
+    ) -> Result<VlessOut, VlessError> {
+        Ok(VlessOut {
+            header: Some(build_request_header(&uuid, flow, command, address, port)?),
+            writer: VisionWriter::new(uuid),
+        })
+    }
+
+    /// Wrap one payload for the tunnel. The first call rides the request
+    /// header inside the Vision stream; after the padding END everything is
+    /// an identity-free direct copy, matching Xray's `*isPadding = false`.
+    pub fn wrap(&mut self, payload: &[u8]) -> Vec<u8> {
+        match self.header.take() {
+            Some(mut first) => {
+                first.extend_from_slice(payload);
+                self.writer.pad(&first, true, true)
+            }
+            None => self.writer.pad(payload, false, false),
+        }
+    }
+}
+
+/// Client-side VLESS + Vision stream reader: unwraps record plaintexts
+/// opened from the Reality layer back into tunnel payloads. The FIRST
+/// plaintext is the server's Vision-framed response (header + optional
+/// first data); later plaintexts are direct-copy payload.
+pub struct VlessIn {
+    response_seen: bool,
+    reader: VisionReader,
+}
+
+impl VlessIn {
+    pub fn new(uuid: [u8; 16]) -> VlessIn {
+        VlessIn {
+            response_seen: false,
+            reader: VisionReader::new(uuid),
+        }
+    }
+
+    /// Unwrap one record plaintext. Returns the tunnel payload bytes; an
+    /// empty result means this record only carried the response header.
+    pub fn unwrap(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, VlessError> {
+        let content = self.reader.unpad(plaintext)?;
+        if !self.response_seen {
+            self.response_seen = true;
+            parse_response_header(&content, VERSION)?;
+            return Ok(content[4..].to_vec());
+        }
+        Ok(content)
+    }
+}
+
 /// Parse the VLESS response header; must match the request version.
 pub fn parse_response_header(wire: &[u8], request_version: u8) -> Result<(), VlessError> {
     if wire.len() < 4 || wire[0] != request_version {
@@ -760,6 +879,116 @@ mod tests {
             Err(VlessError::UuidMismatch)
         ));
         assert!(!reader.within_padding_buffers());
+    }
+
+    #[test]
+    fn session_stream_round_trip_header_and_payload() {
+        let uuid = uuid();
+        let mut out = VlessOut::new(
+            uuid,
+            Some("xtls-rprx-vision"),
+            CMD_TCP,
+            &Address::Domain("example.com".into()),
+            443,
+        )
+        .expect("build vless out");
+        let mut input = VlessIn::new(uuid);
+
+        // First payload: request header + data, long-padded Vision stream.
+        let wire1 = out.wrap(b"first-payload");
+        assert!(wire1.starts_with(&uuid));
+
+        // Honest server leg: unpad, split the request header, respond with
+        // the VLESS response header followed by the data.
+        let mut server_reader = VisionReader::new(uuid);
+        let opened = server_reader.unpad(&wire1).expect("server unpads");
+        let hlen = request_header_len(&opened).expect("header len");
+        let request = parse_request_header(&opened[..hlen]).expect("parse request");
+        assert_eq!(request.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(request.port, 443);
+        let server_out = opened[hlen..].to_vec();
+        let mut server_writer = VisionWriter::new(uuid);
+        let mut reply = build_response_header();
+        reply.extend_from_slice(&server_out);
+        let wire_reply = server_writer.pad(&reply, true, true);
+
+        // Client unwraps the server's first record: response header stripped.
+        let got1 = input.unwrap(&wire_reply).expect("unwrap 1");
+        assert_eq!(got1, b"first-payload".to_vec());
+
+        // Later payloads: direct copy, no identity prefix.
+        let wire2 = out.wrap(b"second");
+        assert!(!wire2.starts_with(&uuid));
+        let mut server_reader2 = VisionReader::new(uuid);
+        let opened2 = server_reader2.unpad(&wire2).expect("server unpads 2");
+        let got2 = input.unwrap(&opened2).expect("unwrap 2");
+        assert_eq!(got2, b"second".to_vec());
+    }
+
+    #[test]
+    fn session_stream_survives_frame_reshaping() {
+        let uuid = uuid();
+        let mut out = VlessOut::new(
+            uuid,
+            Some("xtls-rprx-vision"),
+            CMD_TCP,
+            &Address::Ipv4([10, 0, 0, 1]),
+            8443,
+        )
+        .expect("build vless out");
+        let mut input = VlessIn::new(uuid);
+
+        // A payload large enough to force multi-frame reshaping under the
+        // header must survive the server leg and unwrap to exactly the
+        // payload.
+        let big = vec![0xcdu8; MAX_FRAME_BODY * 2 + 5];
+        let wire = out.wrap(&big);
+
+        let mut server_reader = VisionReader::new(uuid);
+        let opened = server_reader.unpad(&wire).expect("server unpads big");
+        let hlen = request_header_len(&opened).expect("header len");
+        assert_eq!(&opened[hlen..], &big[..]);
+
+        let mut server_writer = VisionWriter::new(uuid);
+        let mut reply = build_response_header();
+        reply.extend_from_slice(&big);
+        let wire_reply = server_writer.pad(&reply, false, true);
+        let got = input.unwrap(&wire_reply).expect("unwrap big");
+        assert_eq!(got, big);
+    }
+
+    #[test]
+    fn request_header_len_matches_parse() {
+        let header = build_request_header(
+            &uuid(),
+            Some("xtls-rprx-vision"),
+            CMD_TCP,
+            &Address::Domain("example.com".into()),
+            443,
+        )
+        .expect("build");
+        assert_eq!(request_header_len(&header).expect("len"), header.len());
+
+        let parsed = parse_request_header(&header).expect("parse");
+        assert_eq!(parsed.address, Address::Domain("example.com".into()));
+
+        // A payload appended after the header must not shift the length.
+        let mut with_payload = header.clone();
+        with_payload.extend_from_slice(b"trailing");
+        assert_eq!(
+            request_header_len(&with_payload).expect("len2"),
+            header.len()
+        );
+    }
+
+    #[test]
+    fn parse_uuid_accepts_hyphenated_and_hex() {
+        let raw = "00000000-0000-0000-0000-000000000001";
+        let got = parse_uuid(raw).expect("hyphenated");
+        assert_eq!(got[15], 0x01);
+        assert_eq!(parse_uuid("000102030405060708090a0b0c0d0e0f"), Some(uuid()));
+        assert!(parse_uuid("tooshort").is_none());
+        assert!(parse_uuid("zz000000-0000-0000-0000-000000000000").is_none());
     }
 
     #[test]

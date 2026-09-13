@@ -87,6 +87,7 @@ object VlessProfileParser {
     fun toHandshakeJson(profile: VlessProfile): String = buildString {
         append('{')
         append("\"serverAddress\":\"").append(escape(profile.serverAddress)).append("\",")
+        append("\"uuid\":\"").append(escape(profile.uuid)).append("\",")
         append("\"serverPort\":").append(profile.serverPort).append(',')
         append("\"network\":\"").append(escape(profile.network)).append("\",")
         append("\"security\":\"").append(escape(profile.security)).append("\",")

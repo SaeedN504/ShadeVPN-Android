@@ -45,6 +45,20 @@ pub struct ServerObservation {
     pub sni: String,
     pub session_authenticated: bool,
     pub records_mirrored: u64,
+    /// When the server was told to expect VLESS: the parsed request header
+    /// from the first Vision stream, and how many payload bytes arrived.
+    pub vless_request: Option<VlessRequestObserved>,
+}
+
+/// What the honest server observed of the VLESS inner protocol.
+#[derive(Debug)]
+pub struct VlessRequestObserved {
+    pub uuid: [u8; 16],
+    pub flow: Option<String>,
+    pub command: u8,
+    pub address: crate::vless::Address,
+    pub port: u16,
+    pub payload_bytes: u64,
 }
 
 /// Client side of a completed wire handshake, ready for the tunnel pump,
@@ -88,12 +102,31 @@ pub fn open_tunnel(sni: &str, server_secret_bytes: [u8; 32]) -> Result<ClientTun
 
 /// Spawn a single-connection honest server on an ephemeral port. Returns the
 /// bound port and a handle whose join yields the observation (or error).
+/// Raw mode: data records are mirrored verbatim (pre-VLESS tests).
 pub fn spawn(
     server_secret_bytes: [u8; 32],
 ) -> (u16, thread::JoinHandle<Result<ServerObservation, String>>) {
+    spawn_mode(server_secret_bytes, None)
+}
+
+/// VLESS mode: the server parses the VLESS request header from the first
+/// Vision stream, answers with the real VLESS response header, and echoes
+/// unpadded payloads back as raw record plaintexts.
+pub fn spawn_vless(
+    server_secret_bytes: [u8; 32],
+    expect_uuid: [u8; 16],
+) -> (u16, thread::JoinHandle<Result<ServerObservation, String>>) {
+    spawn_mode(server_secret_bytes, Some(expect_uuid))
+}
+
+fn spawn_mode(
+    server_secret_bytes: [u8; 32],
+    expect_vless_uuid: Option<[u8; 16]>,
+) -> (u16, thread::JoinHandle<Result<ServerObservation, String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local addr").port();
-    let handle = thread::spawn(move || run_server(listener, server_secret_bytes));
+    let handle =
+        thread::spawn(move || run_server(listener, server_secret_bytes, expect_vless_uuid));
     (port, handle)
 }
 
@@ -115,6 +148,7 @@ fn hkdf_expand(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> {
 fn run_server(
     listener: TcpListener,
     server_secret_bytes: [u8; 32],
+    expect_vless_uuid: Option<[u8; 16]>,
 ) -> Result<ServerObservation, String> {
     let (mut stream, _peer) = listener
         .accept()
@@ -179,10 +213,15 @@ fn run_server(
     response.extend_from_slice(&sealed_confirm);
     write_frame(&mut stream, &response).map_err(|e| format!("write response: {e}"))?;
 
-    // ---- record loop: open client data records, seal a mirror back ----
+    // ---- record loop: open client data records, verify VLESS framing,
+    // seal a mirror back ----
     let recv_cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&server_recv_key));
     let mut seq_in: u64 = 0;
     let mut seq_out: u64 = 0;
+    let mut vless_reader = expect_vless_uuid.map(crate::vless::VisionReader::new);
+    let mut vless_writer = expect_vless_uuid.map(crate::vless::VisionWriter::new);
+    let mut vless_request: Option<VlessRequestObserved> = None;
+    let mut payload_bytes: u64 = 0;
     loop {
         match read_frame(&mut stream) {
             Ok(Some(frame)) => {
@@ -194,9 +233,51 @@ fn run_server(
                     .decrypt(Nonce::from_slice(&in_nonce), frame.as_ref())
                     .map_err(|_| "record failed to open".to_owned())?;
                 seq_in += 1;
+
+                // What goes back on the wire depends on the mode.
+                let reply = match (&mut vless_reader, &mut vless_writer) {
+                    (Some(reader), Some(writer)) => {
+                        // VLESS mode: unpad the Vision stream; the first
+                        // record carries the request header. Answer with the
+                        // response header + payload, Vision-padded.
+                        let unpadded = reader
+                            .unpad(&opened)
+                            .map_err(|e| format!("vision unpad: {e:?}"))?;
+                        let payload = if vless_request.is_none() {
+                            let hlen = crate::vless::request_header_len(&unpadded)
+                                .map_err(|e| format!("request header: {e:?}"))?;
+                            let req = crate::vless::parse_request_header(&unpadded[..hlen])
+                                .map_err(|e| format!("request header: {e:?}"))?;
+                            if req.uuid != expect_vless_uuid.unwrap() {
+                                return Err("vless uuid mismatch".to_owned());
+                            }
+                            payload_bytes += (unpadded.len() - hlen) as u64;
+                            vless_request = Some(VlessRequestObserved {
+                                uuid: req.uuid,
+                                flow: req.flow,
+                                command: req.command,
+                                address: req.address,
+                                port: req.port,
+                                payload_bytes,
+                            });
+                            let mut resp = crate::vless::build_response_header();
+                            resp.extend_from_slice(&unpadded[hlen..]);
+                            resp
+                        } else {
+                            payload_bytes += unpadded.len() as u64;
+                            if let Some(v) = vless_request.as_mut() {
+                                v.payload_bytes = payload_bytes;
+                            }
+                            unpadded
+                        };
+                        writer.pad(&payload, false, true)
+                    }
+                    _ => opened, // raw mode: mirror verbatim
+                };
+
                 let out_nonce = derive_nonce(&sid, seq_out, Direction::Server, NONCE_PURPOSE_DATA);
                 let resealed = send_cipher
-                    .encrypt(Nonce::from_slice(&out_nonce), opened.as_ref())
+                    .encrypt(Nonce::from_slice(&out_nonce), reply.as_ref())
                     .map_err(|_| "re-seal failed".to_owned())?;
                 seq_out += 1;
                 write_frame(&mut stream, &resealed).map_err(|e| format!("write record: {e}"))?;
@@ -210,5 +291,6 @@ fn run_server(
         sni,
         session_authenticated: true,
         records_mirrored: seq_out,
+        vless_request,
     })
 }

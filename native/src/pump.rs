@@ -17,6 +17,7 @@
 
 use crate::handshake::HandshakeState;
 use crate::transport::{read_frame, write_frame};
+use crate::vless::{VlessIn, VlessOut};
 use std::io::{ErrorKind, Write};
 use std::net::{Shutdown, TcpStream};
 use std::os::unix::io::RawFd;
@@ -47,13 +48,28 @@ pub struct PumpStats {
 }
 
 /// Pump behavior knobs.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PumpConfig {
     /// Drop (blackhole) all IPv6 packets read from the TUN instead of
     /// sealing them. The pump is the only egress from the TUN, so dropping
     /// here means IPv6 never reaches the underlying network while the VPN
     /// still advertises an IPv6 route to catch that traffic.
     pub block_ipv6: bool,
+    /// VLESS inner-protocol parameters. When present, every payload is
+    /// wrapped in the VLESS + Vision stream before it is sealed into a
+    /// Reality record (request header rides the first outbound record; the
+    /// inbound direction strips the VLESS response header).
+    pub vless: Option<VlessParams>,
+}
+
+/// Inner-protocol parameters handed in by the session layer.
+#[derive(Debug, Clone)]
+pub struct VlessParams {
+    pub uuid: [u8; 16],
+    pub flow: Option<String>,
+    pub command: u8,
+    pub address: crate::vless::Address,
+    pub port: u16,
 }
 
 /// IP version nibble of an IPv4/IPv6 header.
@@ -202,7 +218,13 @@ impl TunnelPump {
         let inner = Arc::clone(&self.inner);
         self.inner.alive.store(2, Ordering::SeqCst);
 
-        // ---- outbound: TUN -> seal -> socket ----
+        // The VLESS+Vision stream state, when the session carries it.
+        let mut vless_out = config.vless.as_ref().and_then(|p| {
+            VlessOut::new(p.uuid, p.flow.as_deref(), p.command, &p.address, p.port).ok()
+        });
+        let mut vless_in = config.vless.as_ref().map(|p| VlessIn::new(p.uuid));
+
+        // ---- outbound: TUN -> VLESS/Vision wrap -> seal -> socket ----
         {
             let inner = Arc::clone(&inner);
             let handshake = Arc::clone(&handshake);
@@ -229,7 +251,11 @@ impl TunnelPump {
                                 continue;
                             }
                             let seq = inner.seq_out.fetch_add(1, Ordering::SeqCst);
-                            match handshake.seal_record(seq, &buf[..n]) {
+                            let wrapped = match vless_out {
+                                Some(ref mut v) => v.wrap(&buf[..n]),
+                                None => buf[..n].to_vec(),
+                            };
+                            match handshake.seal_record(seq, &wrapped) {
                                 Ok(sealed) => {
                                     if write_frame(&mut out_socket, &sealed).is_ok() {
                                         TunnelInner::bump(&inner.stats, |s| {
@@ -273,7 +299,14 @@ impl TunnelPump {
                                 continue;
                             }
                             let seq = inner.seq_in.fetch_add(1, Ordering::SeqCst);
-                            match handshake.open_record(seq, &frame) {
+                            let opened = handshake
+                                .open_record(seq, &frame)
+                                .map_err(|_| ())
+                                .and_then(|pt| match vless_in {
+                                    Some(ref mut v) => v.unwrap(&pt).map_err(|_| ()),
+                                    None => Ok(pt),
+                                });
+                            match opened {
                                 Ok(packet) => {
                                     if tun.write_all(&packet).is_ok() {
                                         TunnelInner::bump(&inner.stats, |s| {
@@ -407,7 +440,10 @@ mod tests {
             tun.as_raw_fd(),
             tunnel.socket,
             Arc::clone(&tunnel.state),
-            PumpConfig { block_ipv6: false },
+            PumpConfig {
+                block_ipv6: false,
+                vless: None,
+            },
             0,
             0,
         )
@@ -452,7 +488,10 @@ mod tests {
             tun.as_raw_fd(),
             tunnel.socket,
             Arc::clone(&tunnel.state),
-            PumpConfig { block_ipv6: true },
+            PumpConfig {
+                block_ipv6: true,
+                vless: None,
+            },
             0,
             0,
         )
@@ -577,6 +616,90 @@ mod tests {
         pump.stop();
         // Server counters: 1 probe + 1 data record in, both mirrored.
         server_saw(tunnel.server, 2, "seq.example.com");
+    }
+
+    /// Full VLESS+Vision data-plane round trip: IP packet into the TUN,
+    /// wrapped in the VLESS request header inside a Vision stream, sealed as
+    /// a Reality record, parsed by the honest server (which sees the real
+    /// request header on the wire), answered with the VLESS response header,
+    /// unwrapped by the pump, delivered out of the TUN byte-for-byte.
+    #[test]
+    fn vless_vision_round_trip_through_honest_server() {
+        let uuid: [u8; 16] = core::array::from_fn(|i| i as u8);
+        let (port, server) = test_server::spawn_vless(SERVER_SECRET, uuid);
+        let params = crate::handshake::HandshakeParams {
+            server_address: "127.0.0.1".into(),
+            server_port: port,
+            sni: "vless.example.com".into(),
+            server_public_key: *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(
+                SERVER_SECRET,
+            ))
+            .as_bytes(),
+            short_id: vec![0x01, 0x02],
+            fingerprint: None,
+        };
+        let state = crate::handshake::HandshakeState::initiate(&params).expect("initiate");
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        write_frame(&mut socket, state.client_hello()).expect("hello");
+        let response = read_frame(&mut socket)
+            .expect("read response")
+            .expect("response present");
+        state.complete(&response).expect("complete");
+        let state = Arc::new(state);
+
+        let (tun, mut tun_peer) = UnixStream::pair().expect("socketpair");
+        let pump = TunnelPump::new();
+        pump.start(
+            tun.as_raw_fd(),
+            socket,
+            state,
+            PumpConfig {
+                block_ipv6: false,
+                vless: Some(VlessParams {
+                    uuid,
+                    flow: Some("xtls-rprx-vision".into()),
+                    command: crate::vless::CMD_TCP,
+                    address: crate::vless::Address::Domain("vless.example.com".into()),
+                    port: 443,
+                }),
+            },
+            0,
+            0,
+        )
+        .expect("pump start");
+
+        let payload: Vec<u8> = [0x45u8, 0, 0, 28].iter().copied().chain(0u8..=23).collect();
+        tun_peer.write_all(&payload).expect("write packet");
+        tun_peer.flush().unwrap();
+
+        let echoed = wait_for_output(&mut tun_peer, Duration::from_secs(5));
+        assert_eq!(
+            echoed, payload,
+            "vless-wrapped packet must survive the full tunnel round trip byte-for-byte"
+        );
+        let stats = pump.stats();
+        assert_eq!(stats.seal_errors, 0);
+        assert_eq!(stats.open_errors, 0);
+        pump.stop();
+
+        // Wire truth: the honest server parsed the actual VLESS request
+        // header from the Vision stream.
+        let obs = server
+            .join()
+            .expect("server thread panicked")
+            .expect("server session failed");
+        assert!(obs.session_authenticated);
+        let req = obs
+            .vless_request
+            .expect("server must observe the vless request");
+        assert_eq!(req.uuid, uuid);
+        assert_eq!(req.flow.as_deref(), Some("xtls-rprx-vision"));
+        assert_eq!(req.port, 443);
+        assert_eq!(
+            req.address,
+            crate::vless::Address::Domain("vless.example.com".into())
+        );
+        assert_eq!(req.payload_bytes, payload.len() as u64);
     }
 
     #[test]

@@ -39,6 +39,8 @@ struct RealityProfile {
     #[serde(default)]
     #[serde(rename = "shortId")]
     short_id: Option<String>,
+    #[serde(default)]
+    uuid: Option<String>,
 }
 
 fn json_string(env: &mut JNIEnv, value: &str) -> jstring {
@@ -83,6 +85,9 @@ fn teardown_session(s: &mut Session) {
     s.socket = None; // TcpStream drop closes the fd
     s.next_out_seq = 0;
     s.next_in_seq = 0;
+    if let Ok(mut slot) = VLESS_TUNNEL.lock() {
+        *slot = None;
+    }
 }
 
 #[no_mangle]
@@ -211,6 +216,22 @@ fn run_connect(env: &mut JNIEnv, profile_json: JString) -> Result<String, String
     };
     let params = material.into_params().map_err(|e| e.reason().to_owned())?;
 
+    // Capture the VLESS inner-protocol identity for the pump. Key material
+    // lives in the session state only — never in logs or status lines.
+    let uuid_raw = profile
+        .uuid
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .ok_or("profile UUID is required")?;
+    let vless_uuid = vless::parse_uuid(uuid_raw).ok_or("profile UUID is malformed")?;
+    let vless_params = pump::VlessParams {
+        uuid: vless_uuid,
+        flow: Some("xtls-rprx-vision".to_owned()),
+        command: vless::CMD_TCP,
+        address: vless::Address::Domain(params.sni.clone()),
+        port: params.server_port,
+    };
+
     // 1. TCP connect.
     let addr = format!("{}:{}", params.server_address, params.server_port);
     let socket_addr = addr
@@ -246,6 +267,9 @@ fn run_connect(env: &mut JNIEnv, profile_json: JString) -> Result<String, String
         s.handshake = Some(Arc::new(state));
         s.socket = Some(socket);
     });
+    if let Ok(mut slot) = VLESS_TUNNEL.lock() {
+        *slot = Some(vless_params);
+    }
     Ok(response_b64)
 }
 
@@ -359,7 +383,10 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeStartTunnelP
             fd,
             socket,
             state,
-            PumpConfig { block_ipv6 },
+            PumpConfig {
+                block_ipv6,
+                vless: vless_params(),
+            },
             s.next_out_seq,
             s.next_in_seq,
         )
@@ -423,6 +450,18 @@ fn read_profile(env: &mut JNIEnv, value: JString) -> Result<RealityProfile, Stri
         .into_owned();
     serde_json::from_str(&raw).map_err(|_| "invalid sanitized profile JSON".to_owned())
 }
+
+/// VLESS inner-protocol parameters for the pump. The session stores the
+/// profile UUID from the connect step (never logged); without one the pump
+/// runs with the raw record layer only.
+fn vless_params() -> Option<pump::VlessParams> {
+    VLESS_TUNNEL.lock().ok()?.clone()
+}
+
+/// The profile's VLESS identity for the live tunnel, captured at connect
+/// time and cleared on teardown. Static Mutex<Option<_>>: the session is
+/// single-connection, matching `SESSION`.
+static VLESS_TUNNEL: Mutex<Option<pump::VlessParams>> = Mutex::new(None);
 
 #[cfg(test)]
 mod tests {

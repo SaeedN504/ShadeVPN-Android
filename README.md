@@ -74,6 +74,27 @@ What still does **not** exist yet:
   programmatic verification of Android's lockdown mode is on-device work)
 - Fallback lane racing (MASQUE H2, Shadowsocks 2022)
 
+### Running a test server (Xray on your VPS)
+
+The native client currently speaks a byte-exact REALITY handshake against
+the honest in-process test server. To interop against the real thing, set
+up Xray-core on any Debian/Ubuntu VPS:
+
+```sh
+sh ./server/install-xray.sh
+```
+
+The script is fully self-contained: it installs Xray-core, generates the
+UUID / x25519 keypair / short id **on the server** (no key material is ever
+in this repo or your laptop), writes `/usr/local/etc/xray/config.json`, and
+prints a ready-to-paste `vless://` link for the app. Re-running it rotates
+all secrets. It targets port 443 with SNI camouflage to `www.microsoft.com`
+(swap `DEST_SNI` in the script for a different decoy).
+
+Note: the app's Reality client is not yet wired to ride a full TLS stack,
+so the first live interop against this endpoint is the remaining transport
+milestone (see below).
+
 ### Repository split
 
 - `ShadeVPN`: TypeScript/React/Xray server panel and PWA.

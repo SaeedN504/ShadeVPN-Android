@@ -28,8 +28,8 @@
 //!
 //! No secret is ever formatted into an error string.
 
-use rand_core::RngCore;
 use rand_core::OsRng;
+use rand_core::RngCore;
 
 /// VLESS protocol version byte (Xray: `encoding.Version = 0`).
 pub const VERSION: u8 = 0;
@@ -103,7 +103,7 @@ pub enum VlessError {
     Layout,
     /// The response header did not match the request.
     BadResponse,
-    /// The UUID prefix check failed on the first padding frame.
+    /// The identity prefix check failed on a stream that required it.
     UuidMismatch,
     /// A Vision frame declared a length outside the legal bounds.
     BadFrame,
@@ -114,7 +114,7 @@ impl VlessError {
         match self {
             VlessError::Layout => "vless fixed-layout overflow",
             VlessError::BadResponse => "vless response rejected",
-            VlessError::UuidMismatch => "padding uuid mismatch",
+            VlessError::UuidMismatch => "padding identity mismatch",
             VlessError::BadFrame => "padding frame out of bounds",
         }
     }
@@ -204,9 +204,7 @@ pub fn parse_request_header(wire: &[u8]) -> Result<ParsedRequest, VlessError> {
             .checked_add(len)
             .filter(|&e| e <= addons.len())
             .ok_or(VlessError::Layout)?;
-        flow = Some(
-            String::from_utf8(addons[apos..end].to_vec()).map_err(|_| VlessError::Layout)?,
-        );
+        flow = Some(String::from_utf8(addons[apos..end].to_vec()).map_err(|_| VlessError::Layout)?);
     }
 
     if pos >= wire.len() {
@@ -326,9 +324,11 @@ fn decode_varint(wire: &[u8]) -> Result<(usize, usize), VlessError> {
     Err(VlessError::Layout)
 }
 
-/// Write-side state for one Vision direction. `write_once_uuid` mirrors
-/// Xray's `writeOnceUserUUID`: the UUID rides ONLY on the first padding
-/// frame of the stream, then the slot is emptied.
+/// Write-side state for one Vision direction. Mirrors Xray's
+/// `writeOnceUserUUID`: the identity prefix rides ONLY on the first padding
+/// frame of the stream, then the slot is emptied. Once a direction emits
+/// END, subsequent `pad` calls return the payload unpadded (direct copy),
+/// matching Xray's `*isPadding = false`.
 pub struct VisionWriter {
     uuid: Option<[u8; 16]>,
     is_padding: bool,
@@ -351,67 +351,49 @@ impl VisionWriter {
     /// reshaped into `buf.Size - 21`-bounded frames exactly like
     /// `ReshapeMultiBuffer` + `XtlsPadding`. `long_padding` applies the
     /// header-hiding long padding (used on the first frames of a TLS flow);
-    /// `force_end` emits `CommandPaddingEnd` on the final frame (the
-    /// non-TLS "finish one packet early" path).
+    /// `force_end` emits `CommandPaddingEnd` on the final frame, after which
+    /// the direction stops padding (direct copy) exactly like Xray.
     pub fn pad(&mut self, payload: &[u8], long_padding: bool, force_end: bool) -> Vec<u8> {
+        if !self.is_padding {
+            return payload.to_vec();
+        }
+        // The identity prefix is written once for the whole stream: even
+        // when one `pad` call reshapes a large payload into multiple
+        // frames, only the FIRST frame carries the prefix.
+        let mut uuid = self.uuid.take();
         let mut out = Vec::with_capacity(payload.len() + 64);
         let mut remaining = payload;
-        let uuid = self.uuid.take();
         loop {
             let is_last = remaining.len() <= MAX_FRAME_BODY;
             let content = &remaining[..remaining.len().min(MAX_FRAME_BODY)];
-            let command = if is_last && (force_end || !self.is_padding_after()) {
+            let command = if is_last && force_end {
                 PADDING_END
             } else {
                 PADDING_CONTINUE
             };
-            out.extend_from_slice(&xtls_padding(
-                content,
-                command,
-                uuid,
-                long_padding && self.uuid.is_none(),
-            ));
+            out.extend_from_slice(&xtls_padding(content, command, uuid, long_padding));
+            uuid = None;
             if is_last {
                 break;
             }
             remaining = &remaining[MAX_FRAME_BODY..];
         }
-        // After the stream's first END the direction stops padding (Xray:
-        // `*isPadding = false`), and later writes pass through as raw data.
-        if out
-            .windows(1)
-            .any(|w| w[0] == PADDING_END)
-        {
-            // never match raw content — see note below; command lives at a
-            // fixed offset so this scan is structural in tests only.
+        if force_end {
+            self.is_padding = false;
         }
-        self.is_padding = !self.ends_with_end(&out);
         out
-    }
-
-    fn is_padding_after(&self) -> bool {
-        self.is_padding
-    }
-
-    fn ends_with_end(&self, _out: &[u8]) -> bool {
-        // Deterministic: pad() emits END on the final frame when the caller
-        // requested it (force_end) or once padding has already stopped.
-        // Xray's writer sets isPadding=false right after issuing END; the
-        // caller drives that through `finish_padding()`.
-        false
-    }
-
-    /// Mark the direction as finished: subsequent `pad` calls return the
-    /// payload unpadded (direct copy), matching Xray's `*isPadding = false`.
-    pub fn finish_padding(&mut self) {
-        self.is_padding = false;
     }
 }
 
 /// Sample the padding length exactly like `XtlsPadding`: long padding draws
 /// from `[900 - content, 900)`, regular padding from `[0, 256)`, and the
 /// result is capped at `buf.Size - 21 - contentLen`.
-fn xtls_padding(content: &[u8], command: u8, uuid: Option<[u8; 16]>, long_padding: bool) -> Vec<u8> {
+fn xtls_padding(
+    content: &[u8],
+    command: u8,
+    uuid: Option<[u8; 16]>,
+    long_padding: bool,
+) -> Vec<u8> {
     let content_len = content.len();
     let mut padding_len = if content_len < TESTSEED[0] as usize && long_padding {
         OsRng.next_u64() as usize % (TESTSEED[1] as usize) + TESTSEED[2] as usize - content_len
@@ -436,13 +418,19 @@ fn xtls_padding(content: &[u8], command: u8, uuid: Option<[u8; 16]>, long_paddin
 
 /// Read-side state for one Vision direction: mirrors `XtlsUnpadding`'s
 /// remaining-command/content/padding triple with the -1 initial state.
+///
+/// `Initial` models the stream-start decision: a buffer that carries the
+/// identity prefix locks the reader onto padding parsing; a short or
+/// non-prefixed buffer (e.g. an unpadded response header) passes through
+/// untouched. Once the stream is `WithinPaddingBuffers`, a boundary buffer
+/// that fails the prefix check is a desync and is rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnpadState {
-    /// Initial: the next byte must start a frame (UUID + header) or the
-    /// buffer passes through untouched.
+    /// At a frame boundary: the next buffer must start a frame (prefix +
+    /// header) or it passes through untouched.
     Initial,
     /// Reading the 5-byte frame header (command, content len, padding len).
-    Header { need: u8 },
+    Header,
     /// Draining declared content bytes.
     Content { remaining: u32 },
     /// Skipping declared padding bytes.
@@ -454,13 +442,17 @@ enum UnpadState {
 pub struct VisionReader {
     state: UnpadState,
     command: u8,
-    uuid: Option<[u8; 16]>,
-    content: Vec<u8>,
+    uuid: [u8; 16],
     header: [u8; 5],
     header_fill: usize,
-    /// Xray's `WithinPaddingBuffers`: once a UUID-prefixed stream is seen,
+    /// Xray's `WithinPaddingBuffers`: once a prefixed stream is seen,
     /// everything stays inside padding parsing until END/DIRECT.
     within_padding_buffers: bool,
+    /// The very first buffer of the stream must either carry the prefix
+    /// (>= 21 bytes) or be too short to be a padding frame. A >= 21-byte
+    /// first buffer without the prefix is rejected, not passed through:
+    /// that is a peer claiming framing it cannot produce.
+    first_buffer: bool,
 }
 
 impl VisionReader {
@@ -468,11 +460,11 @@ impl VisionReader {
         VisionReader {
             state: UnpadState::Initial,
             command: 0,
-            uuid: Some(uuid),
-            content: Vec::new(),
+            uuid,
             header: [0u8; 5],
             header_fill: 0,
             within_padding_buffers: false,
+            first_buffer: true,
         }
     }
 
@@ -482,24 +474,29 @@ impl VisionReader {
     }
 
     /// Feed wire bytes; returns the unpadded payload bytes. Mirrors
-    /// `XtlsUnpadding`: the initial state requires the UUID prefix to lock
-    /// onto the framing; without it, bytes pass through unchanged.
+    /// `XtlsUnpadding`: the initial state requires the prefix to lock onto
+    /// the framing; without it, bytes pass through unchanged.
     pub fn unpad(&mut self, wire: &[u8]) -> Result<Vec<u8>, VlessError> {
         let mut out = Vec::with_capacity(wire.len());
         let mut wire = wire;
 
         if self.state == UnpadState::Initial {
-            // Look for the UUID prefix. Xray checks `b.Len() >= 21 &&
-            // bytes.Equal(UserUUID, b.BytesTo(16))` on the FIRST buffer of
-            // the stream; a non-matching buffer passes through untouched.
-            let want = self.uuid.as_ref().ok_or(VlessError::UuidMismatch)?;
-            if wire.len() >= 21 && &wire[..16] == &want[..] {
-                self.state = UnpadState::Header { need: 5 };
+            // Xray checks `b.Len() >= 21 && bytes.Equal(UserUUID,
+            // b.BytesTo(16))` on the first buffer of the stream; a
+            // non-matching buffer passes through untouched.
+            if wire.len() >= 21 && wire[..16] == self.uuid {
+                self.state = UnpadState::Header;
                 self.within_padding_buffers = true;
+                self.first_buffer = false;
                 wire = &wire[16..];
-            } else if self.within_padding_buffers {
+            } else if self.first_buffer && wire.len() >= 21 {
+                // First buffer, big enough to be a padding frame, wrong
+                // prefix: reject instead of copying an unauthenticated
+                // stream through as if it were ours.
+                self.first_buffer = false;
                 return Err(VlessError::UuidMismatch);
             } else {
+                self.first_buffer = false;
                 out.extend_from_slice(wire);
                 return Ok(out);
             }
@@ -509,7 +506,7 @@ impl VisionReader {
             match self.state {
                 UnpadState::Initial => unreachable!("handled above"),
                 UnpadState::Direct => out.push(byte),
-                UnpadState::Header { need } => {
+                UnpadState::Header => {
                     self.header[self.header_fill] = byte;
                     self.header_fill += 1;
                     if self.header_fill == 5 {
@@ -519,42 +516,47 @@ impl VisionReader {
                         let padding_len =
                             u16::from_be_bytes([self.header[3], self.header[4]]) as u32;
                         self.header_fill = 0;
-                        if content_len > MAX_FRAME_BODY as u32 || padding_len > MAX_FRAME_BODY as u32
+                        if content_len > MAX_FRAME_BODY as u32
+                            || padding_len > MAX_FRAME_BODY as u32
                         {
                             return Err(VlessError::BadFrame);
                         }
-                        self.state = if content_len > 0 {
-                            UnpadState::Content { remaining: content_len }
+                        if content_len > 0 {
+                            self.state = UnpadState::Content {
+                                remaining: content_len,
+                            };
                         } else if padding_len > 0 {
-                            UnpadState::Padding { remaining: padding_len }
+                            self.state = UnpadState::Padding {
+                                remaining: padding_len,
+                            };
                         } else {
-                            self.frame_done(&mut out)?;
-                            continue;
-                        };
-                    } else {
-                        self.state = UnpadState::Header { need: need - 1 };
+                            self.frame_done()?;
+                        }
                     }
                 }
                 UnpadState::Content { remaining } => {
                     out.push(byte);
                     if remaining == 1 {
-                        self.state = if self.header_has_padding() {
-                            UnpadState::Padding {
+                        if self.header_has_padding() {
+                            self.state = UnpadState::Padding {
                                 remaining: self.pending_padding(),
-                            }
+                            };
                         } else {
-                            self.frame_done(&mut out)?;
-                            continue;
-                        };
+                            self.frame_done()?;
+                        }
                     } else {
-                        self.state = UnpadState::Content { remaining: remaining - 1 };
+                        self.state = UnpadState::Content {
+                            remaining: remaining - 1,
+                        };
                     }
                 }
                 UnpadState::Padding { remaining } => {
                     if remaining == 1 {
-                        self.frame_done(&mut out)?;
+                        self.frame_done()?;
                     } else {
-                        self.state = UnpadState::Padding { remaining: remaining - 1 };
+                        self.state = UnpadState::Padding {
+                            remaining: remaining - 1,
+                        };
                     }
                 }
             }
@@ -571,14 +573,10 @@ impl VisionReader {
     }
 
     /// One frame finished: dispatch on the command.
-    fn frame_done(&mut self, out: &mut Vec<u8>) -> Result<(), VlessError> {
+    fn frame_done(&mut self) -> Result<(), VlessError> {
         match self.command {
-            PADDING_CONTINUE => self.state = UnpadState::Header { need: 5 },
-            PADDING_END => {
-                self.state = UnpadState::Direct;
-                self.within_padding_buffers = false;
-            }
-            PADDING_DIRECT => {
+            PADDING_CONTINUE => self.state = UnpadState::Header,
+            PADDING_END | PADDING_DIRECT => {
                 self.state = UnpadState::Direct;
                 self.within_padding_buffers = false;
             }
@@ -622,17 +620,13 @@ mod tests {
     fn request_header_round_trips_ipv4_and_ipv6() {
         for (address, wire_addr) in [
             (Address::Ipv4([1, 2, 3, 4]), vec![0x01, 1, 2, 3, 4]),
-            (
-                Address::Ipv6([0x20; 16]),
-                {
-                    let mut v = vec![0x03u8];
-                    v.extend_from_slice(&[0x20u8; 16]);
-                    v
-                },
-            ),
+            (Address::Ipv6([0x20; 16]), {
+                let mut v = vec![0x03u8];
+                v.extend_from_slice(&[0x20u8; 16]);
+                v
+            }),
         ] {
-            let header = build_request_header(&uuid(), None, CMD_TCP, &address, 80)
-                .expect("build");
+            let header = build_request_header(&uuid(), None, CMD_TCP, &address, 80).expect("build");
             let parsed = parse_request_header(&header).expect("parse");
             assert_eq!(parsed.address, address);
             assert_eq!(parsed.port, 80);
@@ -645,14 +639,9 @@ mod tests {
     #[test]
     fn request_header_port_then_address_order() {
         // PortThenAddress: 2-byte BE port comes BEFORE the address bytes.
-        let header = build_request_header(
-            &uuid(),
-            None,
-            CMD_TCP,
-            &Address::Ipv4([9, 8, 7, 6]),
-            0x1234,
-        )
-        .expect("build");
+        let header =
+            build_request_header(&uuid(), None, CMD_TCP, &Address::Ipv4([9, 8, 7, 6]), 0x1234)
+                .expect("build");
         let at = header
             .windows(2)
             .position(|w| w == [0x12, 0x34])
@@ -761,12 +750,29 @@ mod tests {
         let mut other = uuid();
         other[5] ^= 0x11;
         let mut reader = VisionReader::new(other);
-        // The stream opened with padding; a UUID mismatch after the initial
-        // frame would be a desync. Our initial check requires the UUID, so
-        // feed a mutated prefix.
+        // The first buffer is large enough to be a padding frame but does
+        // not carry THIS reader's prefix: a peer claiming framing it cannot
+        // produce. Reject instead of copying it through.
         let mut tampered = frame;
         tampered[0] ^= 0xff;
-        assert!(reader.unpad(&tampered).is_err());
+        assert!(matches!(
+            reader.unpad(&tampered),
+            Err(VlessError::UuidMismatch)
+        ));
+        assert!(!reader.within_padding_buffers());
+    }
+
+    #[test]
+    fn short_unpadded_response_passes_through_then_padding_locks_on() {
+        // Server->client shape: an unpadded response header first (shorter
+        // than any padding frame), then a prefixed padding phase.
+        let mut writer = VisionWriter::new(uuid());
+        let mut reader = VisionReader::new(uuid());
+        let header = b"HTTP/1.1 200 OK\r\n\r\n";
+        assert_eq!(reader.unpad(header.as_ref()).unwrap(), header.to_vec());
+        assert!(!reader.within_padding_buffers());
+        let body = writer.pad(b"body-bytes", true, true);
+        assert_eq!(reader.unpad(&body).unwrap(), b"body-bytes".to_vec());
     }
 
     #[test]

@@ -355,15 +355,14 @@ pub extern "system" fn Java_com_shadevpn_android_NativeBridge_nativeStartTunnelP
             .ok_or("tunnel socket not established")?
             .try_clone()
             .map_err(|e| format!("socket clone failed: {e}"))?;
-        s.pump
-            .start(
-                fd,
-                socket,
-                state,
-                PumpConfig { block_ipv6 },
-                s.next_out_seq,
-                s.next_in_seq,
-            )
+        s.pump.start(
+            fd,
+            socket,
+            state,
+            PumpConfig { block_ipv6 },
+            s.next_out_seq,
+            s.next_in_seq,
+        )
     });
     let value = match outcome {
         Ok(()) => json!({"ok": true, "pump": "started"}),

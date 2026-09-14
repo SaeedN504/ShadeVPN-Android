@@ -30,11 +30,13 @@ What exists now:
   X25519 key share; record keys derive from the post-hello ECDHE bound to
   the authenticated session, so recording today's traffic cannot decrypt
   future sessions even if the server static key leaks
-- **Real TLS 1.3 ClientHello on the wire**: a byte-legal TLS 1.3 record —
-  ephemeral X25519 key in `key_share`, SNI in `server_name`, browser-
-  realistic cipher suites and extensions. Note: until the client rides a
-  full TLS stack the hello fingerprint is nonstandard (hand-built), which
-  is tracked for the on-device TLS-camouflage layer
+- **Real TLS 1.3 ClientHello on the wire**: a byte-legal TLS 1.3 record
+  with a **Chrome-accurate fingerprint** — Chrome 131's cipher list and
+  order (GREASE first), Chrome's extension sequence (GREASE ext leading,
+  RFC 7685 padding trailing, ALPN `h2`/`http/1.1`, compress_certificate,
+  ALPS, delegated_credentials, session_ticket, …), the GREASE dummy
+  key share before the real x25519 key, and 512-byte-boundary padding —
+  so passive DPI sees a browser-shaped handshake
 - **Data-plane probe**: a sealed probe record must open cleanly under the
   negotiated session keys; CONNECTED is only ever reported after this passes
 - **Wire-level transport**: length-prefixed record framing on the tunnel
@@ -67,9 +69,8 @@ Crypto stack (pure Rust, no foreign bindings, MIT-compatible):
 What still does **not** exist yet:
 
 - Interop against a real Xray Reality endpoint (the crypto constructions
-  now match XTLS byte-for-byte; what remains is a full TLS stack on the
-  client for fingerprint realism, and the VLESS VISION inner protocol
-  after the TLS record layer)
+  now match XTLS byte-for-byte and the hello is Chrome-fingerprinted;
+  run `sh ./server/install-xray.sh` on a VPS and dial it to close this out)
 - Always-on/kill-switch enforcement (the settings deep-link exists;
   programmatic verification of Android's lockdown mode is on-device work)
 - Fallback lane racing (MASQUE H2, Shadowsocks 2022)

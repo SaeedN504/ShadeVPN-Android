@@ -11,6 +11,8 @@ mod handshake;
 mod pump;
 mod reality;
 mod tls;
+#[allow(dead_code)] // wired into the live dialer in an upcoming commit
+mod tls13;
 mod transport;
 mod vless;
 

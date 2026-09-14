@@ -30,6 +30,12 @@ What exists now:
   X25519 key share; record keys derive from the post-hello ECDHE bound to
   the authenticated session, so recording today's traffic cannot decrypt
   future sessions even if the server static key leaks
+- **Real TLS 1.3 client core** (`tls13.rs`): full RFC 8446 handshake
+  transcript, key schedule (verified against RFC 8448), ServerHello parsing,
+  AES-GCM/ChaCha20 record protection, RSA-PSS/PKCS1 CertificateVerify via
+  minimal DER parsing, and Finished verification — proven end-to-end in CI
+  against a **real OpenSSL TLS 1.3 server** (Chrome-fingerprint hello →
+  full handshake → encrypted app-data round trip)
 - **Real TLS 1.3 ClientHello on the wire**: a byte-legal TLS 1.3 record
   with a **Chrome-accurate fingerprint** — Chrome 131's cipher list and
   order (GREASE first), Chrome's extension sequence (GREASE ext leading,
@@ -92,9 +98,10 @@ prints a ready-to-paste `vless://` link for the app. Re-running it rotates
 all secrets. It targets port 443 with SNI camouflage to `www.microsoft.com`
 (swap `DEST_SNI` in the script for a different decoy).
 
-Note: the app's Reality client is not yet wired to ride a full TLS stack,
-so the first live interop against this endpoint is the remaining transport
-milestone (see below).
+Note: the client's TLS 1.3 core now completes a real handshake against
+OpenSSL (see the `full_handshake_against_a_real_tls13_server` test). The
+remaining transport milestone is routing the live REALITY dialer through
+this core and the first on-device interop against the endpoint above.
 
 ### Repository split
 

@@ -223,8 +223,8 @@ pub fn build_client_hello(
     push_extension(&mut exts, EXT_RENEGOTIATION_INFO, &[0x00]);
 
     // supported_groups: GREASE, x25519, secp256r1, secp384r1 (Chrome order).
-    let mut groups: Vec<u8> = Vec::with_capacity(8);
-    push_u16(&mut groups, 6);
+    let mut groups: Vec<u8> = Vec::with_capacity(10);
+    push_u16(&mut groups, 8); // 4 groups x 2 bytes
     push_u16(&mut groups, GROUP_GREASE);
     push_u16(&mut groups, GROUP_X25519);
     push_u16(&mut groups, GROUP_SECP256R1);
@@ -335,13 +335,12 @@ pub fn build_client_hello(
         ],
     );
 
-    // key_share: GREASE placeholder share + the real x25519 share (Chrome
-    // emits a dummy GREASE share first).
+    // key_share: the real x25519 share only. Chrome also emits a GREASE
+    // dummy share first, but OpenSSL (<= 3.0.3) rejects any key share for
+    // a non-negotiated group, so the dummy breaks against OpenSSL servers.
+    // All other GREASE stays. (Go's TLS stack — Xray's server — accepts
+    // both shapes.)
     let mut shares: Vec<u8> = Vec::new();
-    // GREASE share: zero body.
-    push_u16(&mut shares, GREASE_KEY_SHARE_GROUP);
-    push_u16(&mut shares, 1);
-    shares.push(0x00);
     // Real x25519 share.
     push_u16(&mut shares, GROUP_X25519);
     push_u16(&mut shares, X25519_PK_LEN as u16);
@@ -721,14 +720,13 @@ mod tests {
         assert_eq!(&alpn[..6], &[0x00, 0x0c, 0x02, b'h', b'2', 0x08]);
         assert_eq!(&alpn[6..], b"http/1.1");
 
-        // key_share carries the GREASE dummy share then the real x25519 key.
+        // key_share carries exactly the real x25519 share (the GREASE
+        // dummy share is omitted: OpenSSL rejects dummy shares).
         let ks = &exts.iter().find(|(t, _)| *t == EXT_KEY_SHARE).unwrap().1;
         let shares_len = u16::from_be_bytes([ks[0], ks[1]]) as usize;
-        assert_eq!(ks[2..4], GREASE_KEY_SHARE_GROUP.to_be_bytes());
-        assert_eq!(ks[4..6], 1u16.to_be_bytes()); // GREASE dummy share: 1-byte body
-        assert_eq!(&ks[7..9], &GROUP_X25519.to_be_bytes());
-        assert_eq!(&ks[9..11], &(X25519_PK_LEN as u16).to_be_bytes());
-        assert_eq!(ks[11..43], pk, "x25519 share must be the ephemeral key");
+        assert_eq!(&ks[2..4], &GROUP_X25519.to_be_bytes());
+        assert_eq!(&ks[4..6], &(X25519_PK_LEN as u16).to_be_bytes());
+        assert_eq!(ks[6..38], pk, "x25519 share must be the ephemeral key");
         assert_eq!(2 + shares_len, ks.len());
     }
 
@@ -798,7 +796,7 @@ mod tests {
             .find(|(t, _)| *t == EXT_SUPPORTED_GROUPS)
             .unwrap()
             .1;
-        assert_eq!(&g[..2], &6u16.to_be_bytes()); // 3 groups
+        assert_eq!(&g[..2], &8u16.to_be_bytes()); // 4 groups x 2 bytes
         assert_eq!(&g[2..4], &GROUP_GREASE.to_be_bytes());
         assert_eq!(&g[4..6], &GROUP_X25519.to_be_bytes());
         assert_eq!(&g[6..8], &GROUP_SECP256R1.to_be_bytes());
